@@ -265,9 +265,9 @@ class TestMarkdownAndChunking:
         assert "https://x.com" in out
         assert "here (https://x.com)" in out
 
-    def test_heading_prefix_stripped(self):
+    def test_heading_prefix_styled(self):
         out = strip_markdown_preserving_urls("# Title\n## Sub")
-        assert out == "Title\nSub"
+        assert out == "【Title】\n【Sub】"
 
     def test_bullet_marker_replaced(self):
         out = strip_markdown_preserving_urls("- a\n- b")
@@ -280,6 +280,23 @@ class TestMarkdownAndChunking:
         out = strip_markdown_preserving_urls(md)
         assert "print('hi')" in out
         assert "```" not in out
+
+    def test_markdown_table_becomes_line_friendly_bullets(self):
+        md = (
+            "| Setting | Value |\n"
+            "| --- | --- |\n"
+            "| Timeout | 30s |\n"
+            "| Retries | 3 |\n"
+        )
+        out = strip_markdown_preserving_urls(md)
+        assert out == "• Setting: Timeout\n  Value: 30s\n• Setting: Retries\n  Value: 3"
+
+    def test_long_plain_lines_are_wrapped_for_copying(self):
+        text = " ".join(f"field_{idx}=value_{idx}" for idx in range(30))
+        out = strip_markdown_preserving_urls(text)
+        assert "\n" in out
+        assert all(len(line) <= _line._LINE_COPY_LINE_WIDTH for line in out.splitlines())
+        assert " ".join(out.split()) == text
 
     def test_split_short_returns_single_chunk(self):
         assert split_for_line("hi") == ["hi"]

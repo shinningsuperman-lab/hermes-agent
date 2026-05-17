@@ -6728,7 +6728,22 @@ class GatewayRunner:
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
+                    try:
+                        import inspect
+                        params = inspect.signature(plugin_handler).parameters
+                        accepts_event = (
+                            "event" in params
+                            or any(
+                                p.kind == inspect.Parameter.VAR_KEYWORD
+                                for p in params.values()
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        accepts_event = False
+                    if accepts_event:
+                        result = plugin_handler(user_args, event=event)
+                    else:
+                        result = plugin_handler(user_args)
                     if asyncio.iscoroutine(result):
                         result = await result
                     return str(result) if result else None

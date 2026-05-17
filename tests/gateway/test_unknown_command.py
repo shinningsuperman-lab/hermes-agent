@@ -324,6 +324,39 @@ async def test_command_hook_fires_for_plugin_registered_command(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_plugin_command_receives_event_when_handler_accepts_it(monkeypatch):
+    """Gateway plugin commands may opt in to the MessageEvent for scope checks."""
+    import gateway.run as gateway_run
+    from hermes_cli import plugins as _plugins_mod
+
+    runner = _make_runner()
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError("plugin command leaked to the agent")
+    )
+    seen = {}
+
+    def handler(args, event=None):
+        seen["args"] = args
+        seen["event"] = event
+        return "handled"
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    monkeypatch.setattr(
+        _plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: handler if name == "adult" else None,
+    )
+
+    result = await runner._handle_message(_make_event("/adult test args"))
+
+    assert result == "handled"
+    assert seen["args"] == "test args"
+    assert seen["event"].source.chat_id == "c1"
+
+
+@pytest.mark.asyncio
 async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     """A rewrite decision should re-resolve the command and route to the new one."""
     import gateway.run as gateway_run

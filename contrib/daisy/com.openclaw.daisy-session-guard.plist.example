@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.openclaw.daisy-session-guard</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/vc/codex/hermes-agent-latest/venv/bin/python</string>
+    <string>/Users/vc/.hermes/profiles/daisy/scripts/session_guard.py</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/vc/.hermes/profiles/daisy/logs/session-guard.stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/vc/.hermes/profiles/daisy/logs/session-guard.stderr.log</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/vc/.hermes/profiles/daisy</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/vc/codex/hermes-agent-latest/venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>DAISY_PROFILE_DIR</key>
+    <string>/Users/vc/.hermes/profiles/daisy</string>
+    <key>DAISY_SESSION_GUARD_MAX_PROMPT_TOKENS</key>
+    <string>60000</string>
+    <key>DAISY_SESSION_GUARD_MAX_TRANSCRIPT_BYTES</key>
+    <string>2000000</string>
+    <key>DAISY_SESSION_GUARD_MAX_JSONL_BYTES</key>
+    <string>2000000</string>
+    <key>DAISY_SESSION_GUARD_MIN_AGE_SECONDS</key>
+    <string>180</string>
+  </dict>
+</dict>
+</plist>

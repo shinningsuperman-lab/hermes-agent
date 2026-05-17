@@ -72,6 +72,7 @@ import os
 import re
 import secrets
 import tempfile
+import textwrap
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -92,7 +93,10 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_audio_from_bytes,
+    cache_document_from_bytes,
     cache_image_from_bytes,
+    cache_video_from_bytes,
 )
 from gateway.config import Platform
 from gateway.session import SessionSource
@@ -152,19 +156,141 @@ _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 _MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _MD_ITAL_RE = re.compile(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)")
 _MD_CODE_INLINE_RE = re.compile(r"`([^`]+)`")
-_MD_CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n?(.*?)```", re.DOTALL)
-_MD_HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
+_MD_FENCE_LINE_RE = re.compile(r"^```[a-zA-Z0-9_+-]*\s*$")
 _MD_BULLET_RE = re.compile(r"^[\s]*[-*+]\s+", re.MULTILINE)
+_LINE_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_LINE_TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
+_LINE_COPY_LINE_WIDTH = 120
+
+
+def _strip_inline_markdown_for_line(text: str) -> str:
+    """Remove inline Markdown while keeping the readable text and bare URLs."""
+    text = _MD_CODE_INLINE_RE.sub(r"\1", text)
+    text = _MD_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
+    text = _MD_BOLD_RE.sub(r"\1", text)
+    text = _MD_ITAL_RE.sub(r"\1", text)
+    return text
+
+
+def _split_table_row_for_line(line: str) -> List[str]:
+    row = line.strip()
+    if row.startswith("|"):
+        row = row[1:]
+    if row.endswith("|"):
+        row = row[:-1]
+    return [_strip_inline_markdown_for_line(cell.strip()) for cell in row.split("|")]
+
+
+def _looks_like_table_row_for_line(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("|") and stripped.endswith("|") and "|" in stripped[1:-1]
+
+
+def _rewrite_table_block_for_line(lines: List[str]) -> List[str]:
+    """Convert a Markdown table into compact LINE-friendly bullet rows."""
+    if len(lines) < 2:
+        return lines
+    headers = _split_table_row_for_line(lines[0])
+    body_rows = [
+        _split_table_row_for_line(line)
+        for line in lines[2:]
+        if line.strip() and not _LINE_TABLE_RULE_RE.match(line.strip())
+    ]
+    if not headers or not body_rows:
+        return lines
+
+    formatted: List[str] = []
+    for row in body_rows:
+        pairs: List[Tuple[str, str]] = []
+        for idx, header in enumerate(headers):
+            if idx >= len(row):
+                break
+            label = header or f"Column {idx + 1}"
+            value = row[idx].strip()
+            if value:
+                pairs.append((label, value))
+        if not pairs:
+            continue
+        if len(pairs) == 1:
+            label, value = pairs[0]
+            formatted.append(f"• {label}: {value}")
+            continue
+        if len(pairs) == 2:
+            label, value = pairs[0]
+            other_label, other_value = pairs[1]
+            formatted.append(f"• {label}: {value}")
+            formatted.append(f"  {other_label}: {other_value}")
+            continue
+        formatted.append("• " + " | ".join(f"{label}: {value}" for label, value in pairs))
+    return formatted or lines
+
+
+def _style_line_heading(line: str) -> Optional[str]:
+    match = _LINE_HEADER_RE.match(line)
+    if not match:
+        return None
+    title = _strip_inline_markdown_for_line(match.group(2).strip())
+    if not title:
+        return ""
+    return f"【{title}】"
+
+
+def _normalize_line_blank_runs(text: str) -> str:
+    result: List[str] = []
+    blank_run = 0
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            blank_run += 1
+            if blank_run <= 1:
+                result.append("")
+            continue
+        blank_run = 0
+        result.append(line)
+    return "\n".join(result).strip()
+
+
+def _wrap_copy_friendly_lines_for_line(text: str) -> str:
+    if not text:
+        return text
+    wrapped: List[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if (
+            len(line) <= _LINE_COPY_LINE_WIDTH
+            or not stripped
+            or line.startswith((" ", "\t"))
+        ):
+            wrapped.append(line)
+            continue
+        wrapped.extend(
+            textwrap.wrap(
+                line,
+                width=_LINE_COPY_LINE_WIDTH,
+                break_long_words=False,
+                break_on_hyphens=False,
+                replace_whitespace=False,
+                drop_whitespace=True,
+            )
+            or [line]
+        )
+    return "\n".join(wrapped).strip()
 
 
 def strip_markdown_preserving_urls(text: str) -> str:
-    """Strip Markdown that LINE can't render, but keep URLs usable.
+    """Format Markdown-ish agent output for LINE text bubbles.
 
     LINE's text bubble has zero Markdown support — bold, italics, code
     fences, headings, and bullet markers all render as literal characters.
     URLs *are* auto-linked by the client, but only when they appear bare
     (not inside ``[label](url)`` syntax). This converts ``[label](url)``
-    to ``label (url)`` so the URL remains tappable, then strips the rest.
+    to ``label (url)`` so the URL remains tappable.
+
+    Instead of flattening everything, keep a WeChat-like visual hierarchy in
+    plain text: headings become ``【Heading】``, bullets become ``•``, Markdown
+    tables become compact key/value bullets, and long copy-heavy lines wrap at
+    a stable width.
 
     Source: PR #18153 (leepoweii) — adapted to keep code-block content
     visible (LINE users frequently want command snippets to land as
@@ -173,26 +299,50 @@ def strip_markdown_preserving_urls(text: str) -> str:
     if not text:
         return text
 
-    # Code blocks first — keep the inner content, drop the fences.
-    def _unfence(m: re.Match) -> str:
-        return m.group(1).rstrip("\n")
-    text = _MD_CODE_BLOCK_RE.sub(_unfence, text)
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    result: List[str] = []
+    in_code_block = False
+    idx = 0
 
-    # Inline code: keep content, drop backticks.
-    text = _MD_CODE_INLINE_RE.sub(r"\1", text)
+    while idx < len(lines):
+        line = lines[idx].rstrip()
+        stripped = line.strip()
 
-    # Markdown links → "label (url)"
-    text = _MD_LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
+        if _MD_FENCE_LINE_RE.match(stripped):
+            in_code_block = not in_code_block
+            idx += 1
+            continue
 
-    # Bold/italic markers — strip.
-    text = _MD_BOLD_RE.sub(r"\1", text)
-    text = _MD_ITAL_RE.sub(r"\1", text)
+        if in_code_block:
+            result.append(line)
+            idx += 1
+            continue
 
-    # Headings (#, ##) and bullet markers — strip the prefix only.
-    text = _MD_HEADING_RE.sub("", text)
-    text = _MD_BULLET_RE.sub("• ", text)
+        if (
+            idx + 1 < len(lines)
+            and _looks_like_table_row_for_line(line)
+            and _LINE_TABLE_RULE_RE.match(lines[idx + 1].strip())
+        ):
+            table_lines = [line, lines[idx + 1].rstrip()]
+            idx += 2
+            while idx < len(lines) and _looks_like_table_row_for_line(lines[idx]):
+                table_lines.append(lines[idx].rstrip())
+                idx += 1
+            result.extend(_rewrite_table_block_for_line(table_lines))
+            continue
 
-    return text
+        heading = _style_line_heading(line)
+        if heading is not None:
+            result.append(heading)
+            idx += 1
+            continue
+
+        styled = _strip_inline_markdown_for_line(line)
+        styled = _MD_BULLET_RE.sub("• ", styled)
+        result.append(styled)
+        idx += 1
+
+    return _wrap_copy_friendly_lines_for_line(_normalize_line_blank_runs("\n".join(result)))
 
 
 def split_for_line(text: str, max_chars: int = LINE_SAFE_BUBBLE_CHARS) -> List[str]:
@@ -422,6 +572,35 @@ def _allowed_for_source(
         rid = source.get("roomId", "")
         return bool(rid) and rid in room_ids
     return False
+
+
+def _line_message_type(msg_type: str, text: str = "") -> MessageType:
+    """Map LINE webhook message types to Hermes' normalized MessageType enum."""
+    if msg_type == "text":
+        return MessageType.COMMAND if (text or "").startswith("/") else MessageType.TEXT
+    return {
+        "image": MessageType.PHOTO,
+        "audio": MessageType.AUDIO,
+        "video": MessageType.VIDEO,
+        "file": MessageType.DOCUMENT,
+        "sticker": MessageType.STICKER,
+        "location": MessageType.LOCATION,
+    }.get(msg_type, MessageType.TEXT)
+
+
+def _line_media_type(msg_type: str, filename: str = "") -> str:
+    """Return a MIME-ish type for LINE media so gateway vision routing works."""
+    if msg_type == "image":
+        return "image/jpeg"
+    if msg_type == "audio":
+        return "audio/mp4"
+    if msg_type == "video":
+        return "video/mp4"
+    if filename:
+        guessed, _ = mimetypes.guess_type(filename)
+        if guessed:
+            return guessed
+    return "application/octet-stream"
 
 
 # ---------------------------------------------------------------------------
@@ -940,10 +1119,11 @@ class LineAdapter(BasePlatformAdapter):
         if msg_type == "text":
             text = msg.get("text", "") or ""
         elif msg_type in ("image", "audio", "video", "file"):
-            local_path = await self._download_media(message_id, msg_type)
+            filename = msg.get("fileName", "") or ""
+            local_path = await self._download_media(message_id, msg_type, filename)
             if local_path:
                 media_urls.append(local_path)
-                media_types.append(msg_type)
+                media_types.append(_line_media_type(msg_type, filename or local_path))
             text = f"[{msg_type}]"
         elif msg_type == "sticker":
             keywords = msg.get("keywords") or []
@@ -969,7 +1149,7 @@ class LineAdapter(BasePlatformAdapter):
 
         event_obj = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT if msg_type == "text" else MessageType.IMAGE,
+            message_type=_line_message_type(msg_type, text),
             source=source_obj,
             raw_message=event,
             message_id=message_id,
@@ -1038,7 +1218,12 @@ class LineAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-    async def _download_media(self, message_id: str, msg_type: str) -> Optional[str]:
+    async def _download_media(
+        self,
+        message_id: str,
+        msg_type: str,
+        filename: str = "",
+    ) -> Optional[str]:
         if not self._client or not message_id:
             return None
         try:
@@ -1053,7 +1238,13 @@ class LineAdapter(BasePlatformAdapter):
             "file": ".bin",
         }.get(msg_type, ".bin")
         try:
-            return cache_image_from_bytes(data, ext=ext)
+            if msg_type == "image":
+                return cache_image_from_bytes(data, ext=ext)
+            if msg_type == "audio":
+                return cache_audio_from_bytes(data, ext=ext)
+            if msg_type == "video":
+                return cache_video_from_bytes(data, ext=ext)
+            return cache_document_from_bytes(data, filename or f"line_{message_id}{ext}")
         except Exception as exc:
             logger.warning("LINE: failed to cache %s payload: %s", msg_type, exc)
             return None
