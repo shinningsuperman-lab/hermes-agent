@@ -921,6 +921,17 @@ def _line_message_type(msg_type: str, text: str = "") -> MessageType:
     }.get(msg_type, MessageType.TEXT)
 
 
+def _message_type_for_attached_media(media_types: List[str]) -> MessageType:
+    for media_type in media_types:
+        if media_type.startswith("image/"):
+            return MessageType.PHOTO
+        if media_type.startswith("video/"):
+            return MessageType.VIDEO
+        if media_type.startswith("audio/"):
+            return MessageType.AUDIO
+    return MessageType.DOCUMENT
+
+
 def _line_media_type(msg_type: str, filename: str = "") -> str:
     """Return a MIME-ish type for LINE media so gateway vision routing works."""
     if msg_type == "image":
@@ -1365,6 +1376,7 @@ class LineAdapter(BasePlatformAdapter):
         self._group_media_context: Dict[str, List[Tuple[float, str, str, str]]] = {}
         self._sent_message_ids: Dict[str, float] = {}
         self._sent_message_context: Dict[str, Tuple[float, str]] = {}
+        self._sent_message_media_context: Dict[str, Tuple[float, str, str]] = {}
         self._group_chime_state: Dict[str, Dict[str, Any]] = {}
         self._group_recent_message_times: Dict[str, List[float]] = {}
         self._group_last_reply_at: Dict[str, float] = {}
@@ -1486,6 +1498,7 @@ class LineAdapter(BasePlatformAdapter):
         self._group_media_context.clear()
         self._sent_message_ids.clear()
         self._sent_message_context.clear()
+        self._sent_message_media_context.clear()
         self._group_chime_state.clear()
         self._group_recent_message_times.clear()
         self._group_last_reply_at.clear()
@@ -1639,6 +1652,7 @@ class LineAdapter(BasePlatformAdapter):
 
         quoted_sent_message = self._is_replying_to_sent_message(msg)
         quoted_sent_text = self._sent_message_text_for_quote(msg)
+        quoted_sent_media = self._sent_message_media_for_quote(msg)
         chime_allowed, chime_reason = (
             self._should_group_chime_in(chat_id, user_id, msg, text)
             if chat_type == "group"
@@ -1660,7 +1674,12 @@ class LineAdapter(BasePlatformAdapter):
         if chat_type == "group":
             text = _strip_leading_group_trigger(text, self.group_trigger_keywords)
 
-        if quoted_message_id and not media_urls:
+        if quoted_sent_media and not media_urls:
+            local_path, media_type = quoted_sent_media
+            media_urls.append(local_path)
+            media_types.append(media_type)
+            logger.info("LINE: attached quoted outbound media for message %s", message_id)
+        elif quoted_message_id and not media_urls:
             local_path = await self._download_media(
                 quoted_message_id,
                 "image",
@@ -1695,7 +1714,7 @@ class LineAdapter(BasePlatformAdapter):
         event_obj = MessageEvent(
             text=text,
             message_type=(
-                MessageType.PHOTO
+                _message_type_for_attached_media(media_types)
                 if media_urls and msg_type == "text"
                 else _line_message_type(msg_type, text)
             ),
@@ -1849,6 +1868,11 @@ class LineAdapter(BasePlatformAdapter):
             for message_id, (ts, text) in self._sent_message_context.items()
             if ts >= cutoff
         }
+        self._sent_message_media_context = {
+            message_id: (ts, path, media_type)
+            for message_id, (ts, path, media_type) in self._sent_message_media_context.items()
+            if ts >= cutoff
+        }
 
     def _remember_sent_messages(
         self,
@@ -1874,6 +1898,13 @@ class LineAdapter(BasePlatformAdapter):
                     context = self._summarize_outgoing_message(original_messages[idx])
                     if context:
                         self._sent_message_context[message_id] = (now, context)
+                    media_context = self._media_context_for_outgoing_message(original_messages[idx])
+                    if media_context:
+                        self._sent_message_media_context[message_id] = (
+                            now,
+                            media_context[0],
+                            media_context[1],
+                        )
         if len(self._sent_message_ids) > 500:
             newest = sorted(self._sent_message_ids.items(), key=lambda kv: kv[1])[-500:]
             self._sent_message_ids = dict(newest)
@@ -1881,6 +1912,11 @@ class LineAdapter(BasePlatformAdapter):
                 message_id: self._sent_message_context[message_id]
                 for message_id in self._sent_message_ids
                 if message_id in self._sent_message_context
+            }
+            self._sent_message_media_context = {
+                message_id: self._sent_message_media_context[message_id]
+                for message_id in self._sent_message_ids
+                if message_id in self._sent_message_media_context
             }
 
     def _summarize_outgoing_message(self, message: Dict[str, Any]) -> str:
@@ -1890,6 +1926,32 @@ class LineAdapter(BasePlatformAdapter):
         if msg_type:
             return f"[{msg_type}]"
         return ""
+
+    def _media_context_for_outgoing_message(self, message: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        msg_type = str((message or {}).get("type") or "")
+        if msg_type not in {"image", "audio", "video"}:
+            return None
+        url = str(
+            (message or {}).get("originalContentUrl")
+            or (message or {}).get("previewImageUrl")
+            or ""
+        )
+        token = self._media_token_from_url(url)
+        if not token:
+            return None
+        entry = self._media_tokens.get(token)
+        if not entry:
+            return None
+        path, expires_at = entry
+        if time.time() > expires_at:
+            return None
+        return path, _line_media_type(msg_type, path)
+
+    def _media_token_from_url(self, url: str) -> str:
+        if not url:
+            return ""
+        match = re.search(r"/line/media/([^/]+)/", url)
+        return match.group(1) if match else ""
 
     def _is_replying_to_sent_message(self, message: Dict[str, Any]) -> bool:
         quoted_message_id = str((message or {}).get("quotedMessageId") or "").strip()
@@ -1905,6 +1967,16 @@ class LineAdapter(BasePlatformAdapter):
         self._prune_sent_message_ids()
         entry = self._sent_message_context.get(quoted_message_id)
         return entry[1] if entry else ""
+
+    def _sent_message_media_for_quote(self, message: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        quoted_message_id = str((message or {}).get("quotedMessageId") or "").strip()
+        if not quoted_message_id:
+            return None
+        self._prune_sent_message_ids()
+        entry = self._sent_message_media_context.get(quoted_message_id)
+        if not entry:
+            return None
+        return entry[1], entry[2]
 
     def _mark_group_message_seen(self, chat_id: str) -> None:
         if not chat_id:
