@@ -138,6 +138,15 @@ MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
 LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
 DEFAULT_GROUP_MEDIA_CONTEXT_TTL_SECONDS = 0.0  # opt-in; preserves old behavior
+SENT_MESSAGE_ID_TTL_SECONDS = 86400  # lets quoted replies address the bot for 1 day
+
+GROUP_REPLY_MODES: Set[str] = {
+    "always",
+    "never",
+    "mention_only",
+    "mention_or_keyword",
+    "keyword_only",
+}
 
 # A 1×1 transparent PNG used as fallback video preview thumbnail when no
 # explicit preview is supplied — LINE requires ``previewImageUrl`` for
@@ -575,17 +584,68 @@ def _allowed_for_source(
     return False
 
 
-def _group_trigger_allowed(text: str, keywords: List[str]) -> bool:
+def _message_mentions_self(message: Optional[Dict[str, Any]]) -> bool:
+    """Return true when LINE's native mention metadata targets this bot."""
+    mention = (message or {}).get("mention") or {}
+    for mentionee in mention.get("mentionees", []) or []:
+        if mentionee.get("isSelf") or str(mentionee.get("type", "")).lower() == "bot":
+            return True
+    return False
+
+
+def _find_group_trigger_keyword(text: str, keywords: List[str]) -> Optional[str]:
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return None
+    for keyword in keywords:
+        clean_keyword = (keyword or "").strip()
+        if not clean_keyword:
+            continue
+        if clean_keyword.isascii():
+            pattern = (
+                rf"(?<![A-Za-z0-9_]){re.escape(clean_keyword)}"
+                rf"(?:(?![A-Za-z0-9_])|(?=[\u4e00-\u9fff]))"
+            )
+            if re.search(pattern, clean_text, flags=re.IGNORECASE):
+                return clean_keyword
+        elif clean_keyword in clean_text:
+            return clean_keyword
+    return None
+
+
+def _group_trigger_allowed(
+    text: str,
+    keywords: List[str],
+    message: Optional[Dict[str, Any]] = None,
+    *,
+    quoted_sent_message: bool = False,
+    mode: str = "mention_or_keyword",
+) -> bool:
     """Return true when a group message should be handled.
 
     An empty keyword list preserves historical behavior for existing LINE
-    profiles. Profiles that opt in with LINE_GROUP_TRIGGER_KEYWORDS can safely
-    join busy groups without replying to every message.
+    profiles. Profiles that opt in with LINE_GROUP_TRIGGER_KEYWORDS or
+    LINE_GROUP_REPLY_MODE can safely join busy groups without replying to every
+    message.
     """
-    if not keywords:
+    clean_mode = (mode or "mention_or_keyword").strip().lower()
+    if clean_mode not in GROUP_REPLY_MODES:
+        clean_mode = "mention_or_keyword"
+    if clean_mode == "never":
+        return False
+    if clean_mode == "always":
         return True
-    haystack = (text or "").casefold()
-    return any(keyword.casefold() in haystack for keyword in keywords)
+    if quoted_sent_message:
+        return True
+    if _message_mentions_self(message):
+        return True
+    if clean_mode == "mention_only":
+        return False
+    if not keywords:
+        return False
+    if clean_mode in {"mention_or_keyword", "keyword_only"}:
+        return bool(_find_group_trigger_keyword(text, keywords))
+    return False
 
 
 def _strip_leading_group_trigger(text: str, keywords: List[str]) -> str:
@@ -629,6 +689,19 @@ def _line_media_type(msg_type: str, filename: str = "") -> str:
     return "application/octet-stream"
 
 
+def _parse_sent_messages_body(body: str) -> List[Dict[str, Any]]:
+    if not body:
+        return []
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return []
+    sent = data.get("sentMessages") if isinstance(data, dict) else None
+    if not isinstance(sent, list):
+        return []
+    return [item for item in sent if isinstance(item, dict)]
+
+
 # ---------------------------------------------------------------------------
 # LINE Reply / Push HTTP client
 # ---------------------------------------------------------------------------
@@ -649,7 +722,7 @@ class _LineClient:
             "Content-Type": "application/json",
         }
 
-    async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
+    async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -658,11 +731,12 @@ class _LineClient:
                 headers=self._headers,
                 json={"replyToken": reply_token, "messages": messages},
             ) as resp:
+                body = await resp.text()
                 if resp.status >= 400:
-                    body = await resp.text()
                     raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+                return _parse_sent_messages_body(body)
 
-    async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
+    async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         import aiohttp
         timeout = aiohttp.ClientTimeout(total=self._timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -671,9 +745,10 @@ class _LineClient:
                 headers=self._headers,
                 json={"to": chat_id, "messages": messages},
             ) as resp:
+                body = await resp.text()
                 if resp.status >= 400:
-                    body = await resp.text()
                     raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+                return _parse_sent_messages_body(body)
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -901,6 +976,16 @@ class LineAdapter(BasePlatformAdapter):
             _csv_list(os.getenv("LINE_GROUP_TRIGGER_KEYWORDS", ""))
             + list(extra.get("group_trigger_keywords", []))
         )
+        default_group_reply_mode = (
+            "mention_or_keyword" if self.group_trigger_keywords else "always"
+        )
+        self.group_reply_mode = (
+            os.getenv("LINE_GROUP_REPLY_MODE")
+            or extra.get("group_reply_mode")
+            or default_group_reply_mode
+        ).strip().lower()
+        if self.group_reply_mode not in GROUP_REPLY_MODES:
+            self.group_reply_mode = default_group_reply_mode
         try:
             self.group_media_context_ttl = float(
                 os.getenv("LINE_GROUP_MEDIA_CONTEXT_TTL_SECONDS")
@@ -955,6 +1040,8 @@ class LineAdapter(BasePlatformAdapter):
         self._media_temp_paths: Set[str] = set()
         self._media_ttl = MEDIA_TOKEN_TTL_SECONDS
         self._group_media_context: Dict[str, List[Tuple[float, str, str, str]]] = {}
+        self._sent_message_ids: Dict[str, float] = {}
+        self._sent_message_context: Dict[str, Tuple[float, str]] = {}
 
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
@@ -1071,6 +1158,8 @@ class LineAdapter(BasePlatformAdapter):
         self._media_temp_paths.clear()
         self._media_tokens.clear()
         self._group_media_context.clear()
+        self._sent_message_ids.clear()
+        self._sent_message_context.clear()
 
         if self._lock_key:
             try:
@@ -1163,7 +1252,8 @@ class LineAdapter(BasePlatformAdapter):
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
 
-        if chat_type == "group" and self.group_trigger_keywords and msg_type != "text":
+        group_gate_enabled = self.group_reply_mode != "always"
+        if chat_type == "group" and group_gate_enabled and msg_type != "text":
             if msg_type == "image" and self.group_media_context_ttl > 0:
                 filename = msg.get("fileName", "") or ""
                 local_path = await self._download_media(
@@ -1216,7 +1306,15 @@ class LineAdapter(BasePlatformAdapter):
         else:
             text = f"[unsupported message type: {msg_type}]"
 
-        if chat_type == "group" and not _group_trigger_allowed(text, self.group_trigger_keywords):
+        quoted_sent_message = self._is_replying_to_sent_message(msg)
+        quoted_sent_text = self._sent_message_text_for_quote(msg)
+        if chat_type == "group" and not _group_trigger_allowed(
+            text,
+            self.group_trigger_keywords,
+            msg,
+            quoted_sent_message=quoted_sent_message,
+            mode=self.group_reply_mode,
+        ):
             logger.info("LINE: ignoring group message without trigger from %s", chat_id)
             return
         if chat_type == "group":
@@ -1264,6 +1362,8 @@ class LineAdapter(BasePlatformAdapter):
             source=source_obj,
             raw_message=event,
             message_id=message_id,
+            reply_to_message_id=quoted_message_id or None,
+            reply_to_text=quoted_sent_text or None,
             media_urls=media_urls,
             media_types=media_types,
         )
@@ -1298,13 +1398,19 @@ class LineAdapter(BasePlatformAdapter):
             chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
             messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
             try:
-                await self._client.reply(reply_token, messages)
+                self._remember_sent_messages(
+                    await self._client.reply(reply_token, messages),
+                    messages,
+                )
                 self._cache.mark_delivered(request_id)
                 self._pending_buttons.pop(chat_id, None)
             except Exception as exc:
                 logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
                 try:
-                    await self._client.push(chat_id, messages)
+                    self._remember_sent_messages(
+                        await self._client.push(chat_id, messages),
+                        messages,
+                    )
                     self._cache.mark_delivered(request_id)
                     self._pending_buttons.pop(chat_id, None)
                 except Exception as exc2:
@@ -1312,20 +1418,32 @@ class LineAdapter(BasePlatformAdapter):
         elif entry.state is State.ERROR:
             text = str(entry.payload or self.interrupted_text)
             try:
-                await self._client.reply(reply_token, [_text_message(text)])
+                messages = [_text_message(text)]
+                self._remember_sent_messages(
+                    await self._client.reply(reply_token, messages),
+                    messages,
+                )
                 self._cache.mark_delivered(request_id)
                 self._pending_buttons.pop(chat_id, None)
             except Exception as exc:
                 logger.warning("LINE: postback ERROR reply failed: %s", exc)
         elif entry.state is State.DELIVERED:
             try:
-                await self._client.reply(reply_token, [_text_message(self.delivered_text)])
+                messages = [_text_message(self.delivered_text)]
+                self._remember_sent_messages(
+                    await self._client.reply(reply_token, messages),
+                    messages,
+                )
             except Exception:
                 pass
         elif entry.state is State.PENDING:
             # Still working — re-issue the wait notice.
             try:
-                await self._client.reply(reply_token, [_text_message(self.pending_text)])
+                messages = [_text_message(self.pending_text)]
+                self._remember_sent_messages(
+                    await self._client.reply(reply_token, messages),
+                    messages,
+                )
             except Exception:
                 pass
 
@@ -1373,6 +1491,71 @@ class LineAdapter(BasePlatformAdapter):
         requester_entries = [entry for entry in entries if user_id and entry[1] == user_id]
         entry = (requester_entries or entries)[-1]
         return entry[2], entry[3]
+
+    def _prune_sent_message_ids(self) -> None:
+        cutoff = time.time() - SENT_MESSAGE_ID_TTL_SECONDS
+        self._sent_message_ids = {
+            message_id: ts
+            for message_id, ts in self._sent_message_ids.items()
+            if ts >= cutoff
+        }
+        self._sent_message_context = {
+            message_id: (ts, text)
+            for message_id, (ts, text) in self._sent_message_context.items()
+            if ts >= cutoff
+        }
+
+    def _remember_sent_messages(
+        self,
+        sent_messages: Any,
+        original_messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        if not isinstance(sent_messages, list):
+            return
+        now = time.time()
+        self._prune_sent_message_ids()
+        original_messages = original_messages or []
+        for idx, item in enumerate(sent_messages):
+            if not isinstance(item, dict):
+                continue
+            message_id = str(item.get("id") or "").strip()
+            if message_id:
+                self._sent_message_ids[message_id] = now
+                if idx < len(original_messages):
+                    context = self._summarize_outgoing_message(original_messages[idx])
+                    if context:
+                        self._sent_message_context[message_id] = (now, context)
+        if len(self._sent_message_ids) > 500:
+            newest = sorted(self._sent_message_ids.items(), key=lambda kv: kv[1])[-500:]
+            self._sent_message_ids = dict(newest)
+            self._sent_message_context = {
+                message_id: self._sent_message_context[message_id]
+                for message_id in self._sent_message_ids
+                if message_id in self._sent_message_context
+            }
+
+    def _summarize_outgoing_message(self, message: Dict[str, Any]) -> str:
+        msg_type = str((message or {}).get("type") or "")
+        if msg_type == "text":
+            return str(message.get("text") or "")[:1000]
+        if msg_type:
+            return f"[{msg_type}]"
+        return ""
+
+    def _is_replying_to_sent_message(self, message: Dict[str, Any]) -> bool:
+        quoted_message_id = str((message or {}).get("quotedMessageId") or "").strip()
+        if not quoted_message_id:
+            return False
+        self._prune_sent_message_ids()
+        return quoted_message_id in self._sent_message_ids
+
+    def _sent_message_text_for_quote(self, message: Dict[str, Any]) -> str:
+        quoted_message_id = str((message or {}).get("quotedMessageId") or "").strip()
+        if not quoted_message_id:
+            return ""
+        self._prune_sent_message_ids()
+        entry = self._sent_message_context.get(quoted_message_id)
+        return entry[1] if entry else ""
 
     async def _download_media(
         self,
@@ -1455,14 +1638,20 @@ class LineAdapter(BasePlatformAdapter):
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply and not force_push:
             try:
-                await self._client.reply(token, messages)
+                self._remember_sent_messages(
+                    await self._client.reply(token, messages),
+                    messages,
+                )
                 return SendResult(success=True, message_id=token)
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 # fall through to push
 
         try:
-            await self._client.push(chat_id, messages)
+            self._remember_sent_messages(
+                await self._client.push(chat_id, messages),
+                messages,
+            )
             return SendResult(success=True, message_id=None)
         except Exception as exc:
             logger.error("LINE: push send failed: %s", exc)
@@ -1542,7 +1731,10 @@ class LineAdapter(BasePlatformAdapter):
                 self.pending_text, self.button_label, rid
             )
             try:
-                await self._client.reply(token, [msg])
+                self._remember_sent_messages(
+                    await self._client.reply(token, [msg]),
+                    [msg],
+                )
                 logger.info("LINE: sent slow-LLM postback button for chat %s (rid=%s)", chat_id, rid)
             except Exception as exc:
                 logger.warning("LINE: postback button send failed: %s", exc)
@@ -1770,16 +1962,25 @@ class LineAdapter(BasePlatformAdapter):
         token, used_reply = self._consume_reply_token(chat_id)
         if used_reply:
             try:
-                await self._client.reply(token, first_batch)
+                self._remember_sent_messages(
+                    await self._client.reply(token, first_batch),
+                    first_batch,
+                )
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
                 try:
-                    await self._client.push(chat_id, first_batch)
+                    self._remember_sent_messages(
+                        await self._client.push(chat_id, first_batch),
+                        first_batch,
+                    )
                 except Exception as exc2:
                     return SendResult(success=False, error=str(exc2))
         else:
             try:
-                await self._client.push(chat_id, first_batch)
+                self._remember_sent_messages(
+                    await self._client.push(chat_id, first_batch),
+                    first_batch,
+                )
             except Exception as exc:
                 return SendResult(success=False, error=str(exc))
 
@@ -1788,7 +1989,10 @@ class LineAdapter(BasePlatformAdapter):
             batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
             rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
             try:
-                await self._client.push(chat_id, batch)
+                self._remember_sent_messages(
+                    await self._client.push(chat_id, batch),
+                    batch,
+                )
             except Exception as exc:
                 logger.warning("LINE: push for follow-up batch failed: %s", exc)
                 return SendResult(success=False, error=str(exc))

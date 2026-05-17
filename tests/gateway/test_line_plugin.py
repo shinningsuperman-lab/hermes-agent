@@ -36,7 +36,10 @@ split_for_line = _line.split_for_line
 build_postback_button_message = _line.build_postback_button_message
 _resolve_chat = _line._resolve_chat
 _allowed_for_source = _line._allowed_for_source
+_find_group_trigger_keyword = _line._find_group_trigger_keyword
 _group_trigger_allowed = _line._group_trigger_allowed
+_message_mentions_self = _line._message_mentions_self
+_parse_sent_messages_body = _line._parse_sent_messages_body
 _strip_leading_group_trigger = _line._strip_leading_group_trigger
 _is_system_bypass = _line._is_system_bypass
 RequestCache = _line.RequestCache
@@ -154,12 +157,28 @@ class TestAllowlist:
         assert not _allowed_for_source(src, allow_all=False, user_ids=set(), group_ids=set(), room_ids=set())
 
     def test_empty_group_trigger_keywords_preserve_existing_behavior(self):
-        assert _group_trigger_allowed("anything", [])
+        assert _group_trigger_allowed("anything", [], mode="always")
 
     def test_group_trigger_keywords_match_case_insensitively(self):
         assert _group_trigger_allowed("@Daisy 測試", ["@daisy", "黛西"])
         assert _group_trigger_allowed("請黛西查一下", ["@daisy", "黛西"])
         assert not _group_trigger_allowed("普通聊天", ["@daisy", "黛西"])
+
+    def test_group_trigger_keywords_use_word_boundaries_for_ascii(self):
+        assert _find_group_trigger_keyword("hi ai?", ["ai"]) == "ai"
+        assert _find_group_trigger_keyword("daily update", ["ai"]) is None
+
+    def test_group_trigger_allows_native_line_mention(self):
+        message = {"mention": {"mentionees": [{"isSelf": True}]}}
+        assert _message_mentions_self(message)
+        assert _group_trigger_allowed("看這個", ["daisy"], message)
+
+    def test_group_trigger_allows_reply_to_sent_message(self):
+        assert _group_trigger_allowed(
+            "這個是什麼",
+            ["daisy"],
+            quoted_sent_message=True,
+        )
 
     def test_leading_group_trigger_is_stripped(self):
         assert _strip_leading_group_trigger("@daisy：測試", ["@daisy"]) == "測試"
@@ -644,6 +663,7 @@ class TestAdapterInit:
         assert ad.public_base_url == "https://x.example.com"
         assert ad.allowed_users == {"U1", "U2"}
         assert ad.group_trigger_keywords == []
+        assert ad.group_reply_mode == "always"
 
     def test_env_overrides_extra(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "env-tok")
@@ -668,6 +688,7 @@ class TestAdapterInit:
         assert ad.allowed_users == {"U1", "U2", "U3"}
         assert ad.allowed_groups == {"C1"}
         assert ad.group_trigger_keywords == ["@daisy", "黛西"]
+        assert ad.group_reply_mode == "mention_or_keyword"
 
     def test_env_group_media_context_ttl_parsed(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
@@ -676,6 +697,19 @@ class TestAdapterInit:
         from gateway.config import PlatformConfig
         ad = LineAdapter(PlatformConfig(enabled=True))
         assert ad.group_media_context_ttl == 600.0
+
+    def test_env_group_reply_mode_parsed(self, monkeypatch):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_GROUP_REPLY_MODE", "mention_only")
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        assert ad.group_reply_mode == "mention_only"
+
+    def test_parse_sent_message_response_body(self):
+        body = json.dumps({"sentMessages": [{"id": "m1", "quoteToken": "q1"}]})
+        assert _parse_sent_messages_body(body) == [{"id": "m1", "quoteToken": "q1"}]
+        assert _parse_sent_messages_body("") == []
 
     def test_get_chat_info_infers_type_from_prefix(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")

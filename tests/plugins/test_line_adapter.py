@@ -47,6 +47,7 @@ async def test_line_image_message_event_uses_photo_and_image_mime(monkeypatch):
 async def test_line_group_trigger_filters_and_strips_text(monkeypatch):
     adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
     adapter.group_trigger_keywords = ["@daisy", "黛西"]
+    adapter.group_reply_mode = "mention_or_keyword"
     captured = []
 
     async def fake_handle_message(event):
@@ -75,9 +76,74 @@ async def test_line_group_trigger_filters_and_strips_text(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_line_group_native_mention_triggers_without_keyword(monkeypatch):
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter.group_trigger_keywords = ["@daisy"]
+    adapter.group_reply_mode = "mention_or_keyword"
+    captured = []
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "C-test", "userId": "U-test"},
+            "message": {
+                "type": "text",
+                "id": "line-text-1",
+                "text": "看一下這個",
+                "mention": {"mentionees": [{"isSelf": True}]},
+            },
+        }
+    )
+
+    assert len(captured) == 1
+    assert captured[0].text == "看一下這個"
+
+
+@pytest.mark.asyncio
+async def test_line_group_reply_to_sent_message_triggers_without_keyword(monkeypatch):
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter.group_trigger_keywords = ["@daisy"]
+    adapter.group_reply_mode = "mention_or_keyword"
+    adapter._remember_sent_messages(
+        [{"id": "daisy-message-1"}],
+        [{"type": "text", "text": "這是 Daisy 前一則回覆"}],
+    )
+    captured = []
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "C-test", "userId": "U-test"},
+            "message": {
+                "type": "text",
+                "id": "line-text-1",
+                "text": "這個是什麼意思",
+                "quotedMessageId": "daisy-message-1",
+            },
+        }
+    )
+
+    assert len(captured) == 1
+    assert captured[0].text == "這個是什麼意思"
+    assert captured[0].reply_to_message_id == "daisy-message-1"
+    assert captured[0].reply_to_text == "這是 Daisy 前一則回覆"
+
+
+@pytest.mark.asyncio
 async def test_line_group_text_reply_attaches_quoted_image(monkeypatch):
     adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
     adapter.group_trigger_keywords = ["@daisy"]
+    adapter.group_reply_mode = "mention_or_keyword"
     captured = []
 
     async def fake_download_media(message_id, msg_type, filename="", *, warn=True):
@@ -115,6 +181,7 @@ async def test_line_group_text_reply_attaches_quoted_image(monkeypatch):
 async def test_line_group_image_context_is_cached_then_attached(monkeypatch):
     adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
     adapter.group_trigger_keywords = ["@daisy"]
+    adapter.group_reply_mode = "mention_or_keyword"
     adapter.group_media_context_ttl = 600
     captured = []
 
