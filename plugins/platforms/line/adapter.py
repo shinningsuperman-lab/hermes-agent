@@ -146,7 +146,170 @@ GROUP_REPLY_MODES: Set[str] = {
     "mention_only",
     "mention_or_keyword",
     "keyword_only",
+    "mention_keyword_or_chime",
+    "chime_only",
 }
+
+DEFAULT_GROUP_CHIME_IN_COOLDOWN_SECONDS = 300
+DEFAULT_GROUP_CHIME_IN_MIN_CHARS = 4
+DEFAULT_GROUP_CHIME_IN_MAX_PER_DAY = 12
+DEFAULT_GROUP_CHIME_IN_MIN_SCORE = 3
+DEFAULT_GROUP_CHIME_IN_RECENT_REPLY_COOLDOWN_SECONDS = 0
+DEFAULT_GROUP_CHIME_IN_HIGH_PRIORITY_SCORE = 6
+DEFAULT_GROUP_CHIME_IN_BURST_WINDOW_SECONDS = 180
+DEFAULT_GROUP_CHIME_IN_BURST_MESSAGE_COUNT = 16
+
+GROUP_CHIME_QUESTION_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"[?？]",
+        r"怎麼看",
+        r"怎麼辦",
+        r"如何",
+        r"要不要",
+        r"好不好",
+        r"可以嗎",
+        r"行嗎",
+        r"會不會",
+        r"有沒有",
+        r"推薦",
+        r"建議",
+        r"哪個",
+        r"選哪",
+        r"覺得",
+        r"適合",
+        r"該不該",
+    )
+)
+
+GROUP_CHIME_ASSISTANT_TASK_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"幫我",
+        r"幫忙",
+        r"麻煩",
+        r"請幫",
+        r"可以幫",
+        r"看一下",
+        r"看這",
+        r"查一下",
+        r"查查看",
+        r"算一下",
+        r"整理",
+        r"摘要",
+        r"分析",
+        r"判斷",
+        r"翻譯",
+        r"轉成",
+        r"弄成",
+        r"做成",
+    )
+)
+
+GROUP_CHIME_GOLF_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"成績",
+        r"讓桿",
+        r"總桿",
+        r"淨桿",
+        r"排名",
+        r"誰贏",
+        r"桿數",
+        r"球局",
+    )
+)
+
+GROUP_CHIME_GROUP_ASK_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"大家覺得",
+        r"你們覺得",
+        r"各位",
+        r"有人知道",
+        r"有人推薦",
+        r"問一下",
+        r"請教一下",
+        r"求推薦",
+        r"求救",
+        r"有人用過",
+        r"哪個比較",
+    )
+)
+
+GROUP_CHIME_COORDINATION_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"誰要",
+        r"有沒有人要",
+        r"要不要約",
+        r"一起",
+        r"幾點",
+        r"約嗎",
+        r"集合",
+        r"哪天",
+        r"誰方便",
+        r"誰有空",
+        r"要訂嗎",
+    )
+)
+
+GROUP_CHIME_SUPPORT_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"好累",
+        r"好煩",
+        r"崩潰",
+        r"睡不著",
+        r"不舒服",
+        r"焦慮",
+        r"壓力",
+        r"難過",
+        r"心情不好",
+        r"快瘋",
+    )
+)
+
+GROUP_CHIME_SINGULAR_DIRECTED_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^(你|妳)(?!們)",
+        r"(你|妳)覺得",
+        r"(你|妳)要不要",
+        r"(你|妳)可以",
+        r"(你|妳)呢",
+        r"跟你說",
+        r"問你",
+    )
+)
+
+GROUP_CHIME_SELF_OPINION_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^我覺得",
+        r"^我比較想",
+        r"^我偏向",
+        r"^我會選",
+        r"^我選",
+    )
+)
+
+GROUP_CHIME_STATUS_UPDATE_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^(我(先|剛|等等|等下|去|到了|到家|下班|睡了|出門|回來|吃飽|洗澡)|已經|收到|報告一下|更新一下|我決定)",
+        r"(我先|我去|我到了|我下班了|我先睡|我先忙|我先撤)",
+        r"(已寄出|已送出|已到|已處理)",
+    )
+)
+
+GROUP_CHIME_LOW_SIGNAL_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"^(早安|午安|晚安|安安|收到|好喔|好哦|ok|okay|感謝|謝啦|謝謝|哈哈+|呵呵+|lol|www|讚|推|yes|no)[!！.。 ]*$",
+        r"^[\W_ 😂🤣😆😅🙂🙃😉👍🙏❤️❤💯🔥]+$",
+    )
+)
 
 # A 1×1 transparent PNG used as fallback video preview thumbnail when no
 # explicit preview is supplied — LINE requires ``previewImageUrl`` for
@@ -619,6 +782,7 @@ def _group_trigger_allowed(
     message: Optional[Dict[str, Any]] = None,
     *,
     quoted_sent_message: bool = False,
+    chime_allowed: bool = False,
     mode: str = "mention_or_keyword",
 ) -> bool:
     """Return true when a group message should be handled.
@@ -642,10 +806,93 @@ def _group_trigger_allowed(
     if clean_mode == "mention_only":
         return False
     if not keywords:
-        return False
-    if clean_mode in {"mention_or_keyword", "keyword_only"}:
-        return bool(_find_group_trigger_keyword(text, keywords))
+        return chime_allowed and clean_mode in {"mention_keyword_or_chime", "chime_only"}
+    if clean_mode in {"mention_or_keyword", "keyword_only", "mention_keyword_or_chime"}:
+        if bool(_find_group_trigger_keyword(text, keywords)):
+            return True
+    if clean_mode in {"mention_keyword_or_chime", "chime_only"}:
+        return chime_allowed
     return False
+
+
+def _group_chime_score(text: str, *, has_recent_media: bool = False, has_quote: bool = False) -> Tuple[int, List[str]]:
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return -99, ["empty"]
+
+    score = 0
+    reasons: List[str] = []
+    positive_reasons: Set[str] = set()
+
+    for pattern in GROUP_CHIME_QUESTION_PATTERNS:
+        if pattern.search(clean_text):
+            score += 3
+            reasons.append("question")
+            positive_reasons.add("question")
+            break
+    for pattern in GROUP_CHIME_ASSISTANT_TASK_PATTERNS:
+        if pattern.search(clean_text):
+            score += 4
+            reasons.append("assistant_task")
+            positive_reasons.add("assistant_task")
+            break
+    for pattern in GROUP_CHIME_GOLF_PATTERNS:
+        if pattern.search(clean_text):
+            score += 2
+            reasons.append("golf_context")
+            positive_reasons.add("golf_context")
+            break
+    for label, patterns in (
+        ("group_ask", GROUP_CHIME_GROUP_ASK_PATTERNS),
+        ("coordination", GROUP_CHIME_COORDINATION_PATTERNS),
+        ("support", GROUP_CHIME_SUPPORT_PATTERNS),
+    ):
+        for pattern in patterns:
+            if pattern.search(clean_text):
+                score += 3
+                reasons.append(label)
+                positive_reasons.add(label)
+                break
+
+    if has_recent_media:
+        score += 2
+        reasons.append("recent_media")
+    if has_quote:
+        score += 2
+        reasons.append("quote")
+    if len(clean_text) >= 24:
+        score += 1
+        reasons.append("longer_context")
+    if len(clean_text) >= 60 and positive_reasons:
+        score += 1
+        reasons.append("rich_context")
+
+    for pattern in GROUP_CHIME_LOW_SIGNAL_PATTERNS:
+        if pattern.fullmatch(clean_text):
+            score -= 4
+            reasons.append("low_signal")
+            break
+    for pattern in GROUP_CHIME_SINGULAR_DIRECTED_PATTERNS:
+        if pattern.search(clean_text) and "group_ask" not in positive_reasons:
+            score -= 2
+            reasons.append("single_person_directed")
+            break
+    for pattern in GROUP_CHIME_SELF_OPINION_PATTERNS:
+        if pattern.search(clean_text) and not {"group_ask", "coordination"} & positive_reasons:
+            score -= 2
+            reasons.append("self_opinion")
+            break
+    for pattern in GROUP_CHIME_STATUS_UPDATE_PATTERNS:
+        if pattern.search(clean_text) and not positive_reasons:
+            score -= 2
+            reasons.append("status_update")
+            break
+
+    if not positive_reasons and re.search(r"[。.]$", clean_text):
+        score -= 1
+        reasons.append("closed_statement")
+
+    return score, reasons
 
 
 def _strip_leading_group_trigger(text: str, keywords: List[str]) -> str:
@@ -915,6 +1162,16 @@ def _truthy_env(name: str, default: bool = False) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _int_env_or_extra(name: str, extra: Dict[str, Any], key: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        raw = extra.get(key, default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -996,6 +1253,61 @@ class LineAdapter(BasePlatformAdapter):
             )
         except (TypeError, ValueError):
             self.group_media_context_ttl = DEFAULT_GROUP_MEDIA_CONTEXT_TTL_SECONDS
+        self.group_chime_in_enabled = _truthy_env(
+            "LINE_GROUP_CHIME_IN_ENABLED",
+            bool(extra.get("group_chime_in_enabled", False)),
+        )
+        self.group_chime_in_cooldown_seconds = _int_env_or_extra(
+            "LINE_GROUP_CHIME_IN_COOLDOWN_SECONDS",
+            extra,
+            "group_chime_in_cooldown_seconds",
+            DEFAULT_GROUP_CHIME_IN_COOLDOWN_SECONDS,
+        )
+        self.group_chime_in_min_chars = _int_env_or_extra(
+            "LINE_GROUP_CHIME_IN_MIN_CHARS",
+            extra,
+            "group_chime_in_min_chars",
+            DEFAULT_GROUP_CHIME_IN_MIN_CHARS,
+        )
+        self.group_chime_in_max_per_day = _int_env_or_extra(
+            "LINE_GROUP_CHIME_IN_MAX_PER_DAY",
+            extra,
+            "group_chime_in_max_per_day",
+            DEFAULT_GROUP_CHIME_IN_MAX_PER_DAY,
+        )
+        self.group_chime_in_min_score = _int_env_or_extra(
+            "LINE_GROUP_CHIME_IN_MIN_SCORE",
+            extra,
+            "group_chime_in_min_score",
+            DEFAULT_GROUP_CHIME_IN_MIN_SCORE,
+        )
+        self.group_chime_in_recent_reply_cooldown_seconds = _int_env_or_extra(
+            "LINE_GROUP_CHIME_IN_RECENT_REPLY_COOLDOWN_SECONDS",
+            extra,
+            "group_chime_in_recent_reply_cooldown_seconds",
+            DEFAULT_GROUP_CHIME_IN_RECENT_REPLY_COOLDOWN_SECONDS,
+        )
+        self.group_chime_in_high_priority_score = _int_env_or_extra(
+            "LINE_GROUP_CHIME_IN_HIGH_PRIORITY_SCORE",
+            extra,
+            "group_chime_in_high_priority_score",
+            DEFAULT_GROUP_CHIME_IN_HIGH_PRIORITY_SCORE,
+        )
+        self.group_chime_in_burst_window_seconds = _int_env_or_extra(
+            "LINE_GROUP_CHIME_IN_BURST_WINDOW_SECONDS",
+            extra,
+            "group_chime_in_burst_window_seconds",
+            DEFAULT_GROUP_CHIME_IN_BURST_WINDOW_SECONDS,
+        )
+        self.group_chime_in_burst_message_count = _int_env_or_extra(
+            "LINE_GROUP_CHIME_IN_BURST_MESSAGE_COUNT",
+            extra,
+            "group_chime_in_burst_message_count",
+            DEFAULT_GROUP_CHIME_IN_BURST_MESSAGE_COUNT,
+        )
+        self.group_chime_in_allowed_groups = _csv_set(
+            os.getenv("LINE_GROUP_CHIME_IN_ALLOWED_GROUPS", "")
+        ) | set(extra.get("group_chime_in_allowed_groups", []))
 
         # Slow-LLM postback button threshold
         try:
@@ -1042,6 +1354,9 @@ class LineAdapter(BasePlatformAdapter):
         self._group_media_context: Dict[str, List[Tuple[float, str, str, str]]] = {}
         self._sent_message_ids: Dict[str, float] = {}
         self._sent_message_context: Dict[str, Tuple[float, str]] = {}
+        self._group_chime_state: Dict[str, Dict[str, Any]] = {}
+        self._group_recent_message_times: Dict[str, List[float]] = {}
+        self._group_last_reply_at: Dict[str, float] = {}
 
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
@@ -1160,6 +1475,9 @@ class LineAdapter(BasePlatformAdapter):
         self._group_media_context.clear()
         self._sent_message_ids.clear()
         self._sent_message_context.clear()
+        self._group_chime_state.clear()
+        self._group_recent_message_times.clear()
+        self._group_last_reply_at.clear()
 
         if self._lock_key:
             try:
@@ -1251,6 +1569,8 @@ class LineAdapter(BasePlatformAdapter):
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
+        if chat_type == "group":
+            self._mark_group_message_seen(chat_id)
 
         group_gate_enabled = self.group_reply_mode != "always"
         if chat_type == "group" and group_gate_enabled and msg_type != "text":
@@ -1308,15 +1628,24 @@ class LineAdapter(BasePlatformAdapter):
 
         quoted_sent_message = self._is_replying_to_sent_message(msg)
         quoted_sent_text = self._sent_message_text_for_quote(msg)
+        chime_allowed, chime_reason = (
+            self._should_group_chime_in(chat_id, user_id, msg, text)
+            if chat_type == "group"
+            else (False, "")
+        )
         if chat_type == "group" and not _group_trigger_allowed(
             text,
             self.group_trigger_keywords,
             msg,
             quoted_sent_message=quoted_sent_message,
+            chime_allowed=chime_allowed,
             mode=self.group_reply_mode,
         ):
             logger.info("LINE: ignoring group message without trigger from %s", chat_id)
             return
+        if chime_allowed:
+            self._record_group_chime(chat_id, text, chime_reason)
+            logger.info("LINE: allowing group chime-in from %s (%s)", chat_id, chime_reason)
         if chat_type == "group":
             text = _strip_leading_group_trigger(text, self.group_trigger_keywords)
 
@@ -1401,6 +1730,7 @@ class LineAdapter(BasePlatformAdapter):
                 self._remember_sent_messages(
                     await self._client.reply(reply_token, messages),
                     messages,
+                    chat_id=chat_id,
                 )
                 self._cache.mark_delivered(request_id)
                 self._pending_buttons.pop(chat_id, None)
@@ -1410,6 +1740,7 @@ class LineAdapter(BasePlatformAdapter):
                     self._remember_sent_messages(
                         await self._client.push(chat_id, messages),
                         messages,
+                        chat_id=chat_id,
                     )
                     self._cache.mark_delivered(request_id)
                     self._pending_buttons.pop(chat_id, None)
@@ -1422,6 +1753,7 @@ class LineAdapter(BasePlatformAdapter):
                 self._remember_sent_messages(
                     await self._client.reply(reply_token, messages),
                     messages,
+                    chat_id=chat_id,
                 )
                 self._cache.mark_delivered(request_id)
                 self._pending_buttons.pop(chat_id, None)
@@ -1433,6 +1765,7 @@ class LineAdapter(BasePlatformAdapter):
                 self._remember_sent_messages(
                     await self._client.reply(reply_token, messages),
                     messages,
+                    chat_id=chat_id,
                 )
             except Exception:
                 pass
@@ -1443,6 +1776,7 @@ class LineAdapter(BasePlatformAdapter):
                 self._remember_sent_messages(
                     await self._client.reply(reply_token, messages),
                     messages,
+                    chat_id=chat_id,
                 )
             except Exception:
                 pass
@@ -1509,9 +1843,13 @@ class LineAdapter(BasePlatformAdapter):
         self,
         sent_messages: Any,
         original_messages: Optional[List[Dict[str, Any]]] = None,
+        *,
+        chat_id: str = "",
     ) -> None:
         if not isinstance(sent_messages, list):
             return
+        if sent_messages:
+            self._mark_group_reply(chat_id)
         now = time.time()
         self._prune_sent_message_ids()
         original_messages = original_messages or []
@@ -1556,6 +1894,130 @@ class LineAdapter(BasePlatformAdapter):
         self._prune_sent_message_ids()
         entry = self._sent_message_context.get(quoted_message_id)
         return entry[1] if entry else ""
+
+    def _mark_group_message_seen(self, chat_id: str) -> None:
+        if not chat_id:
+            return
+        now = time.time()
+        window = max(0, int(self.group_chime_in_burst_window_seconds or 0))
+        cutoff = now - window if window else now
+        recent = [
+            ts
+            for ts in self._group_recent_message_times.get(chat_id, [])
+            if ts >= cutoff
+        ]
+        recent.append(now)
+        self._group_recent_message_times[chat_id] = recent[-100:]
+
+    def _recent_group_message_count(self, chat_id: str) -> int:
+        window = max(0, int(self.group_chime_in_burst_window_seconds or 0))
+        if not chat_id or window <= 0:
+            return 0
+        cutoff = time.time() - window
+        recent = [
+            ts
+            for ts in self._group_recent_message_times.get(chat_id, [])
+            if ts >= cutoff
+        ]
+        self._group_recent_message_times[chat_id] = recent[-100:]
+        return len(recent)
+
+    def _mark_group_reply(self, chat_id: str) -> None:
+        if chat_id.startswith(("C", "R")):
+            self._group_last_reply_at[chat_id] = time.time()
+
+    def _should_group_chime_in(
+        self,
+        chat_id: str,
+        user_id: str,
+        message: Dict[str, Any],
+        text: str,
+    ) -> Tuple[bool, str]:
+        if self.group_reply_mode not in {"mention_keyword_or_chime", "chime_only"}:
+            return False, "mode_without_chime"
+        if not self.group_chime_in_enabled:
+            return False, "chime_disabled"
+        if self.group_chime_in_allowed_groups and chat_id not in self.group_chime_in_allowed_groups:
+            return False, "group_not_allowed"
+        if (message or {}).get("type") != "text":
+            return False, "non_text"
+        if _message_mentions_self(message):
+            return False, "already_mentioned"
+        if _find_group_trigger_keyword(text, self.group_trigger_keywords):
+            return False, "keyword_trigger"
+        if self._is_replying_to_sent_message(message):
+            return False, "quoted_sent_message"
+
+        clean_text = (text or "").strip()
+        has_quote = bool(str((message or {}).get("quotedMessageId") or "").strip())
+        has_recent_media = bool(self._get_recent_group_media(chat_id, user_id))
+        if len(clean_text) < max(0, int(self.group_chime_in_min_chars or 0)) and not has_quote and not has_recent_media:
+            return False, "too_short"
+
+        now = time.time()
+        recent_reply_cooldown = max(
+            0,
+            int(self.group_chime_in_recent_reply_cooldown_seconds or 0),
+        )
+        last_reply_at = self._group_last_reply_at.get(chat_id, 0)
+        if recent_reply_cooldown and last_reply_at and now - last_reply_at < recent_reply_cooldown:
+            return False, "recent_reply"
+
+        state = self._group_chime_state.get(chat_id, {})
+        today = time.strftime("%Y-%m-%d", time.localtime(now))
+        today_count = int(state.get("today_count") or 0)
+        if state.get("last_chime_date") != today:
+            today_count = 0
+        if today_count >= max(0, int(self.group_chime_in_max_per_day or 0)):
+            return False, "daily_limit"
+
+        message_hash = hashlib.sha256(clean_text.encode("utf-8")).hexdigest()[:16]
+        if state.get("last_message_hash") == message_hash:
+            return False, "same_message"
+
+        score, reasons = _group_chime_score(
+            clean_text,
+            has_recent_media=has_recent_media,
+            has_quote=has_quote,
+        )
+        min_score = int(self.group_chime_in_min_score or DEFAULT_GROUP_CHIME_IN_MIN_SCORE)
+        if score < min_score:
+            return False, f"low_score_{score}"
+
+        high_priority_score = int(
+            self.group_chime_in_high_priority_score
+            or DEFAULT_GROUP_CHIME_IN_HIGH_PRIORITY_SCORE
+        )
+        cooldown = max(0, int(self.group_chime_in_cooldown_seconds or 0))
+        last_chime_at = float(state.get("last_chime_at") or 0)
+        if cooldown and last_chime_at and now - last_chime_at < cooldown and score < high_priority_score:
+            return False, "chime_cooldown"
+
+        burst_limit = max(0, int(self.group_chime_in_burst_message_count or 0))
+        recent_count = self._recent_group_message_count(chat_id)
+        if burst_limit and recent_count >= burst_limit and score < high_priority_score:
+            return False, f"group_burst_{recent_count}"
+
+        reason = "+".join(reasons[:4]) if reasons else "scored"
+        return True, f"chime:{reason}:score={score}"
+
+    def _record_group_chime(self, chat_id: str, text: str, reason: str) -> None:
+        if not chat_id:
+            return
+        now = time.time()
+        today = time.strftime("%Y-%m-%d", time.localtime(now))
+        state = self._group_chime_state.get(chat_id, {})
+        today_count = int(state.get("today_count") or 0)
+        if state.get("last_chime_date") != today:
+            today_count = 0
+        clean_text = (text or "").strip()
+        self._group_chime_state[chat_id] = {
+            "last_chime_at": now,
+            "last_chime_date": today,
+            "today_count": today_count + 1,
+            "last_message_hash": hashlib.sha256(clean_text.encode("utf-8")).hexdigest()[:16],
+            "last_reason": reason,
+        }
 
     async def _download_media(
         self,
@@ -1641,6 +2103,7 @@ class LineAdapter(BasePlatformAdapter):
                 self._remember_sent_messages(
                     await self._client.reply(token, messages),
                     messages,
+                    chat_id=chat_id,
                 )
                 return SendResult(success=True, message_id=token)
             except Exception as exc:
@@ -1651,6 +2114,7 @@ class LineAdapter(BasePlatformAdapter):
             self._remember_sent_messages(
                 await self._client.push(chat_id, messages),
                 messages,
+                chat_id=chat_id,
             )
             return SendResult(success=True, message_id=None)
         except Exception as exc:
@@ -1734,6 +2198,7 @@ class LineAdapter(BasePlatformAdapter):
                 self._remember_sent_messages(
                     await self._client.reply(token, [msg]),
                     [msg],
+                    chat_id=chat_id,
                 )
                 logger.info("LINE: sent slow-LLM postback button for chat %s (rid=%s)", chat_id, rid)
             except Exception as exc:
@@ -1965,6 +2430,7 @@ class LineAdapter(BasePlatformAdapter):
                 self._remember_sent_messages(
                     await self._client.reply(token, first_batch),
                     first_batch,
+                    chat_id=chat_id,
                 )
             except Exception as exc:
                 logger.info("LINE: reply token rejected (%s); falling back to push", exc)
@@ -1972,6 +2438,7 @@ class LineAdapter(BasePlatformAdapter):
                     self._remember_sent_messages(
                         await self._client.push(chat_id, first_batch),
                         first_batch,
+                        chat_id=chat_id,
                     )
                 except Exception as exc2:
                     return SendResult(success=False, error=str(exc2))
@@ -1980,6 +2447,7 @@ class LineAdapter(BasePlatformAdapter):
                 self._remember_sent_messages(
                     await self._client.push(chat_id, first_batch),
                     first_batch,
+                    chat_id=chat_id,
                 )
             except Exception as exc:
                 return SendResult(success=False, error=str(exc))
@@ -1992,6 +2460,7 @@ class LineAdapter(BasePlatformAdapter):
                 self._remember_sent_messages(
                     await self._client.push(chat_id, batch),
                     batch,
+                    chat_id=chat_id,
                 )
             except Exception as exc:
                 logger.warning("LINE: push for follow-up batch failed: %s", exc)

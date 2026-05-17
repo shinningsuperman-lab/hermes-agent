@@ -216,3 +216,46 @@ async def test_line_group_image_context_is_cached_then_attached(monkeypatch):
     assert captured[0].message_type is MessageType.PHOTO
     assert captured[0].media_urls == ["/tmp/line-image-1.jpg"]
     assert captured[0].media_types == ["image/jpeg"]
+
+
+@pytest.mark.asyncio
+async def test_line_group_chime_handles_implicit_image_request(monkeypatch):
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter.group_trigger_keywords = ["@daisy"]
+    adapter.group_reply_mode = "mention_keyword_or_chime"
+    adapter.group_chime_in_enabled = True
+    adapter.group_chime_in_cooldown_seconds = 0
+    adapter.group_chime_in_min_score = 3
+    adapter.group_media_context_ttl = 600
+    captured = []
+
+    async def fake_download_media(message_id, msg_type, filename="", *, warn=True):
+        assert message_id == "line-image-1"
+        assert msg_type == "image"
+        return "/tmp/line-image-1.jpg"
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "_download_media", fake_download_media)
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token-1",
+            "source": {"type": "group", "groupId": "C-test", "userId": "U-test"},
+            "message": {"type": "image", "id": "line-image-1"},
+        }
+    )
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token-2",
+            "source": {"type": "group", "groupId": "C-test", "userId": "U-test"},
+            "message": {"type": "text", "id": "line-text-1", "text": "幫我看一下這張成績"},
+        }
+    )
+
+    assert len(captured) == 1
+    assert captured[0].text == "幫我看一下這張成績"
+    assert captured[0].message_type is MessageType.PHOTO
+    assert captured[0].media_urls == ["/tmp/line-image-1.jpg"]

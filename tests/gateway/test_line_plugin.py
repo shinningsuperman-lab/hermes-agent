@@ -37,6 +37,7 @@ build_postback_button_message = _line.build_postback_button_message
 _resolve_chat = _line._resolve_chat
 _allowed_for_source = _line._allowed_for_source
 _find_group_trigger_keyword = _line._find_group_trigger_keyword
+_group_chime_score = _line._group_chime_score
 _group_trigger_allowed = _line._group_trigger_allowed
 _message_mentions_self = _line._message_mentions_self
 _parse_sent_messages_body = _line._parse_sent_messages_body
@@ -179,6 +180,30 @@ class TestAllowlist:
             ["daisy"],
             quoted_sent_message=True,
         )
+
+    def test_group_trigger_allows_chime_mode(self):
+        assert _group_trigger_allowed(
+            "幫我看一下這張成績",
+            ["daisy"],
+            chime_allowed=True,
+            mode="mention_keyword_or_chime",
+        )
+        assert not _group_trigger_allowed(
+            "普通聊天",
+            ["daisy"],
+            chime_allowed=False,
+            mode="mention_keyword_or_chime",
+        )
+
+    def test_group_chime_score_finds_assistant_task(self):
+        score, reasons = _group_chime_score("幫我看一下這張成績")
+        assert score >= 3
+        assert "assistant_task" in reasons
+
+    def test_group_chime_score_suppresses_low_signal(self):
+        score, reasons = _group_chime_score("收到")
+        assert score < 3
+        assert "low_signal" in reasons
 
     def test_leading_group_trigger_is_stripped(self):
         assert _strip_leading_group_trigger("@daisy：測試", ["@daisy"]) == "測試"
@@ -701,10 +726,14 @@ class TestAdapterInit:
     def test_env_group_reply_mode_parsed(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
-        monkeypatch.setenv("LINE_GROUP_REPLY_MODE", "mention_only")
+        monkeypatch.setenv("LINE_GROUP_REPLY_MODE", "mention_keyword_or_chime")
+        monkeypatch.setenv("LINE_GROUP_CHIME_IN_ENABLED", "true")
+        monkeypatch.setenv("LINE_GROUP_CHIME_IN_COOLDOWN_SECONDS", "60")
         from gateway.config import PlatformConfig
         ad = LineAdapter(PlatformConfig(enabled=True))
-        assert ad.group_reply_mode == "mention_only"
+        assert ad.group_reply_mode == "mention_keyword_or_chime"
+        assert ad.group_chime_in_enabled is True
+        assert ad.group_chime_in_cooldown_seconds == 60
 
     def test_parse_sent_message_response_body(self):
         body = json.dumps({"sentMessages": [{"id": "m1", "quoteToken": "q1"}]})
