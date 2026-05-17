@@ -669,6 +669,14 @@ class TestAdapterInit:
         assert ad.allowed_groups == {"C1"}
         assert ad.group_trigger_keywords == ["@daisy", "黛西"]
 
+    def test_env_group_media_context_ttl_parsed(self, monkeypatch):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_GROUP_MEDIA_CONTEXT_TTL_SECONDS", "600")
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        assert ad.group_media_context_ttl == 600.0
+
     def test_get_chat_info_infers_type_from_prefix(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")

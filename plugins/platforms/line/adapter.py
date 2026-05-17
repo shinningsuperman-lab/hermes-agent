@@ -137,6 +137,7 @@ DEFAULT_INTERRUPTED_TEXT = "Run was interrupted before completion."
 MEDIA_TOKEN_TTL_SECONDS = 1800  # 30 minutes; LINE caches the URL aggressively
 LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
+DEFAULT_GROUP_MEDIA_CONTEXT_TTL_SECONDS = 0.0  # opt-in; preserves old behavior
 
 # A 1×1 transparent PNG used as fallback video preview thumbnail when no
 # explicit preview is supplied — LINE requires ``previewImageUrl`` for
@@ -900,6 +901,16 @@ class LineAdapter(BasePlatformAdapter):
             _csv_list(os.getenv("LINE_GROUP_TRIGGER_KEYWORDS", ""))
             + list(extra.get("group_trigger_keywords", []))
         )
+        try:
+            self.group_media_context_ttl = float(
+                os.getenv("LINE_GROUP_MEDIA_CONTEXT_TTL_SECONDS")
+                or extra.get(
+                    "group_media_context_ttl_seconds",
+                    DEFAULT_GROUP_MEDIA_CONTEXT_TTL_SECONDS,
+                )
+            )
+        except (TypeError, ValueError):
+            self.group_media_context_ttl = DEFAULT_GROUP_MEDIA_CONTEXT_TTL_SECONDS
 
         # Slow-LLM postback button threshold
         try:
@@ -943,6 +954,7 @@ class LineAdapter(BasePlatformAdapter):
         self._media_tokens: Dict[str, Tuple[str, float]] = {}  # token → (path, expiry)
         self._media_temp_paths: Set[str] = set()
         self._media_ttl = MEDIA_TOKEN_TTL_SECONDS
+        self._group_media_context: Dict[str, List[Tuple[float, str, str, str]]] = {}
 
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
@@ -1058,6 +1070,7 @@ class LineAdapter(BasePlatformAdapter):
                 pass
         self._media_temp_paths.clear()
         self._media_tokens.clear()
+        self._group_media_context.clear()
 
         if self._lock_key:
             try:
@@ -1151,7 +1164,22 @@ class LineAdapter(BasePlatformAdapter):
         user_id = source.get("userId", "") or chat_id
 
         if chat_type == "group" and self.group_trigger_keywords and msg_type != "text":
-            logger.info("LINE: ignoring group %s message without text trigger from %s", msg_type, chat_id)
+            if msg_type == "image" and self.group_media_context_ttl > 0:
+                filename = msg.get("fileName", "") or ""
+                local_path = await self._download_media(
+                    message_id,
+                    msg_type,
+                    filename,
+                    warn=False,
+                )
+                if local_path:
+                    media_type = _line_media_type(msg_type, filename or local_path)
+                    self._remember_group_media(chat_id, user_id, local_path, media_type)
+                    logger.info("LINE: cached group %s context from %s", msg_type, chat_id)
+                else:
+                    logger.info("LINE: ignoring group %s message without text trigger from %s", msg_type, chat_id)
+            else:
+                logger.info("LINE: ignoring group %s message without text trigger from %s", msg_type, chat_id)
             return
 
         # Stash the reply token for outbound use.
@@ -1166,9 +1194,11 @@ class LineAdapter(BasePlatformAdapter):
         media_urls: List[str] = []
         media_types: List[str] = []
         text = ""
+        quoted_message_id = ""
 
         if msg_type == "text":
             text = msg.get("text", "") or ""
+            quoted_message_id = msg.get("quotedMessageId", "") or ""
         elif msg_type in ("image", "audio", "video", "file"):
             filename = msg.get("fileName", "") or ""
             local_path = await self._download_media(message_id, msg_type, filename)
@@ -1192,6 +1222,26 @@ class LineAdapter(BasePlatformAdapter):
         if chat_type == "group":
             text = _strip_leading_group_trigger(text, self.group_trigger_keywords)
 
+        if quoted_message_id and not media_urls:
+            local_path = await self._download_media(
+                quoted_message_id,
+                "image",
+                f"line_quoted_{quoted_message_id}.jpg",
+                warn=False,
+            )
+            if local_path:
+                media_urls.append(local_path)
+                media_types.append(_line_media_type("image", local_path))
+                logger.info("LINE: attached quoted image content for message %s", message_id)
+
+        if chat_type == "group" and msg_type == "text" and not media_urls:
+            recent_media = self._get_recent_group_media(chat_id, user_id)
+            if recent_media:
+                local_path, media_type = recent_media
+                media_urls.append(local_path)
+                media_types.append(media_type)
+                logger.info("LINE: attached recent group media context from %s", chat_id)
+
         # Best-effort typing indicator (DM only).
         if chat_type == "dm" and self._client:
             asyncio.create_task(self._client.loading(chat_id))
@@ -1206,7 +1256,11 @@ class LineAdapter(BasePlatformAdapter):
 
         event_obj = MessageEvent(
             text=text,
-            message_type=_line_message_type(msg_type, text),
+            message_type=(
+                MessageType.PHOTO
+                if media_urls and msg_type == "text"
+                else _line_message_type(msg_type, text)
+            ),
             source=source_obj,
             raw_message=event,
             message_id=message_id,
@@ -1275,18 +1329,66 @@ class LineAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+    def _prune_group_media_context(self, chat_id: str) -> None:
+        ttl = max(0.0, float(self.group_media_context_ttl or 0.0))
+        if ttl <= 0 or not chat_id:
+            self._group_media_context.pop(chat_id, None)
+            return
+        cutoff = time.time() - ttl
+        entries = [
+            entry
+            for entry in self._group_media_context.get(chat_id, [])
+            if entry[0] >= cutoff
+        ][-10:]
+        if entries:
+            self._group_media_context[chat_id] = entries
+        else:
+            self._group_media_context.pop(chat_id, None)
+
+    def _remember_group_media(
+        self,
+        chat_id: str,
+        user_id: str,
+        local_path: str,
+        media_type: str,
+    ) -> None:
+        if self.group_media_context_ttl <= 0 or not chat_id or not local_path:
+            return
+        self._prune_group_media_context(chat_id)
+        entries = self._group_media_context.setdefault(chat_id, [])
+        entries.append((time.time(), user_id or "", local_path, media_type))
+        self._group_media_context[chat_id] = entries[-10:]
+
+    def _get_recent_group_media(
+        self,
+        chat_id: str,
+        user_id: str,
+    ) -> Optional[Tuple[str, str]]:
+        if self.group_media_context_ttl <= 0 or not chat_id:
+            return None
+        self._prune_group_media_context(chat_id)
+        entries = self._group_media_context.get(chat_id, [])
+        if not entries:
+            return None
+        requester_entries = [entry for entry in entries if user_id and entry[1] == user_id]
+        entry = (requester_entries or entries)[-1]
+        return entry[2], entry[3]
+
     async def _download_media(
         self,
         message_id: str,
         msg_type: str,
         filename: str = "",
+        *,
+        warn: bool = True,
     ) -> Optional[str]:
         if not self._client or not message_id:
             return None
         try:
             data = await self._client.fetch_content(message_id)
         except Exception as exc:
-            logger.warning("LINE: failed to fetch %s content for %s: %s", msg_type, message_id, exc)
+            log = logger.warning if warn else logger.debug
+            log("LINE: failed to fetch %s content for %s: %s", msg_type, message_id, exc)
             return None
         ext = {
             "image": ".jpg",
