@@ -41,3 +41,34 @@ async def test_line_image_message_event_uses_photo_and_image_mime(monkeypatch):
     assert event.message_type is MessageType.PHOTO
     assert event.media_urls == ["/tmp/line-image-1.jpg"]
     assert event.media_types == ["image/jpeg"]
+
+
+@pytest.mark.asyncio
+async def test_line_group_trigger_filters_and_strips_text(monkeypatch):
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter.group_trigger_keywords = ["@daisy", "黛西"]
+    captured = []
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token-1",
+            "source": {"type": "group", "groupId": "C-test", "userId": "U-test"},
+            "message": {"type": "text", "id": "line-text-1", "text": "普通聊天"},
+        }
+    )
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token-2",
+            "source": {"type": "group", "groupId": "C-test", "userId": "U-test"},
+            "message": {"type": "text", "id": "line-text-2", "text": "@daisy：測試"},
+        }
+    )
+
+    assert len(captured) == 1
+    assert captured[0].text == "測試"
+    assert captured[0].source.chat_type == "group"

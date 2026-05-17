@@ -574,6 +574,31 @@ def _allowed_for_source(
     return False
 
 
+def _group_trigger_allowed(text: str, keywords: List[str]) -> bool:
+    """Return true when a group message should be handled.
+
+    An empty keyword list preserves historical behavior for existing LINE
+    profiles. Profiles that opt in with LINE_GROUP_TRIGGER_KEYWORDS can safely
+    join busy groups without replying to every message.
+    """
+    if not keywords:
+        return True
+    haystack = (text or "").casefold()
+    return any(keyword.casefold() in haystack for keyword in keywords)
+
+
+def _strip_leading_group_trigger(text: str, keywords: List[str]) -> str:
+    """Remove a leading mention/keyword before handing text to the agent."""
+    if not text or not keywords:
+        return text
+    stripped = text.lstrip()
+    for keyword in sorted(keywords, key=len, reverse=True):
+        if stripped.casefold().startswith(keyword.casefold()):
+            remainder = stripped[len(keyword):].lstrip(" \t:：,，")
+            return remainder or text
+    return text
+
+
 def _line_message_type(msg_type: str, text: str = "") -> MessageType:
     """Map LINE webhook message types to Hermes' normalized MessageType enum."""
     if msg_type == "text":
@@ -789,6 +814,24 @@ def _csv_set(value: str) -> Set[str]:
     return {x.strip() for x in value.split(",") if x.strip()}
 
 
+def _csv_list(value: str) -> List[str]:
+    if not value:
+        return []
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    result: List[str] = []
+    for value in values:
+        key = value.casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
 def _truthy_env(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -853,6 +896,10 @@ class LineAdapter(BasePlatformAdapter):
         self.allowed_rooms = _csv_set(
             os.getenv("LINE_ALLOWED_ROOMS", "")
         ) | set(extra.get("allowed_rooms", []))
+        self.group_trigger_keywords = _dedupe_preserve_order(
+            _csv_list(os.getenv("LINE_GROUP_TRIGGER_KEYWORDS", ""))
+            + list(extra.get("group_trigger_keywords", []))
+        )
 
         # Slow-LLM postback button threshold
         try:
@@ -1103,6 +1150,10 @@ class LineAdapter(BasePlatformAdapter):
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
 
+        if chat_type == "group" and self.group_trigger_keywords and msg_type != "text":
+            logger.info("LINE: ignoring group %s message without text trigger from %s", msg_type, chat_id)
+            return
+
         # Stash the reply token for outbound use.
         if chat_id and reply_token:
             self._reply_tokens[chat_id] = (
@@ -1134,6 +1185,12 @@ class LineAdapter(BasePlatformAdapter):
             text = f"[location: {title} {address}]".strip()
         else:
             text = f"[unsupported message type: {msg_type}]"
+
+        if chat_type == "group" and not _group_trigger_allowed(text, self.group_trigger_keywords):
+            logger.info("LINE: ignoring group message without trigger from %s", chat_id)
+            return
+        if chat_type == "group":
+            text = _strip_leading_group_trigger(text, self.group_trigger_keywords)
 
         # Best-effort typing indicator (DM only).
         if chat_type == "dm" and self._client:

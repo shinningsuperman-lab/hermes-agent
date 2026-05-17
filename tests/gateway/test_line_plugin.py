@@ -36,6 +36,8 @@ split_for_line = _line.split_for_line
 build_postback_button_message = _line.build_postback_button_message
 _resolve_chat = _line._resolve_chat
 _allowed_for_source = _line._allowed_for_source
+_group_trigger_allowed = _line._group_trigger_allowed
+_strip_leading_group_trigger = _line._strip_leading_group_trigger
 _is_system_bypass = _line._is_system_bypass
 RequestCache = _line.RequestCache
 State = _line.State
@@ -150,6 +152,19 @@ class TestAllowlist:
     def test_unknown_type_rejected(self):
         src = {"type": "weird"}
         assert not _allowed_for_source(src, allow_all=False, user_ids=set(), group_ids=set(), room_ids=set())
+
+    def test_empty_group_trigger_keywords_preserve_existing_behavior(self):
+        assert _group_trigger_allowed("anything", [])
+
+    def test_group_trigger_keywords_match_case_insensitively(self):
+        assert _group_trigger_allowed("@Daisy 測試", ["@daisy", "黛西"])
+        assert _group_trigger_allowed("請黛西查一下", ["@daisy", "黛西"])
+        assert not _group_trigger_allowed("普通聊天", ["@daisy", "黛西"])
+
+    def test_leading_group_trigger_is_stripped(self):
+        assert _strip_leading_group_trigger("@daisy：測試", ["@daisy"]) == "測試"
+        assert _strip_leading_group_trigger("  黛西 查讓桿", ["黛西"]) == "查讓桿"
+        assert _strip_leading_group_trigger("請黛西查一下", ["黛西"]) == "請黛西查一下"
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +643,7 @@ class TestAdapterInit:
         assert ad.webhook_port == 7777
         assert ad.public_base_url == "https://x.example.com"
         assert ad.allowed_users == {"U1", "U2"}
+        assert ad.group_trigger_keywords == []
 
     def test_env_overrides_extra(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "env-tok")
@@ -646,10 +662,12 @@ class TestAdapterInit:
         monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
         monkeypatch.setenv("LINE_ALLOWED_USERS", "U1, U2,U3")
         monkeypatch.setenv("LINE_ALLOWED_GROUPS", "C1")
+        monkeypatch.setenv("LINE_GROUP_TRIGGER_KEYWORDS", "@daisy, 黛西,@Daisy")
         from gateway.config import PlatformConfig
         ad = LineAdapter(PlatformConfig(enabled=True))
         assert ad.allowed_users == {"U1", "U2", "U3"}
         assert ad.allowed_groups == {"C1"}
+        assert ad.group_trigger_keywords == ["@daisy", "黛西"]
 
     def test_get_chat_info_infers_type_from_prefix(self, monkeypatch):
         monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
