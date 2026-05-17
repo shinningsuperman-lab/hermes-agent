@@ -139,6 +139,7 @@ LINE_IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MB per LINE docs
 LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
 DEFAULT_GROUP_MEDIA_CONTEXT_TTL_SECONDS = 0.0  # opt-in; preserves old behavior
 SENT_MESSAGE_ID_TTL_SECONDS = 86400  # lets quoted replies address the bot for 1 day
+SENT_MEDIA_STATE_FILENAME = "line-sent-media-context.json"
 
 GROUP_REPLY_MODES: Set[str] = {
     "always",
@@ -932,6 +933,31 @@ def _message_type_for_attached_media(media_types: List[str]) -> MessageType:
     return MessageType.DOCUMENT
 
 
+def _text_seems_to_reference_media(text: str) -> bool:
+    clean = (text or "").strip()
+    if not clean:
+        return False
+    return any(
+        token in clean
+        for token in (
+            "它",
+            "這張",
+            "那張",
+            "上一張",
+            "剛剛那張",
+            "這個圖",
+            "那個圖",
+            "圖片",
+            "照片",
+            "貼圖",
+            "圖卡",
+            "圖",
+            "存起來",
+            "保存",
+        )
+    )
+
+
 def _line_media_type(msg_type: str, filename: str = "") -> str:
     """Return a MIME-ish type for LINE media so gateway vision routing works."""
     if msg_type == "image":
@@ -958,6 +984,17 @@ def _parse_sent_messages_body(body: str) -> List[Dict[str, Any]]:
     if not isinstance(sent, list):
         return []
     return [item for item in sent if isinstance(item, dict)]
+
+
+def _line_sent_media_state_path() -> Optional[Path]:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()) / SENT_MEDIA_STATE_FILENAME
+    except Exception:
+        raw_home = os.getenv("HERMES_HOME", "").strip()
+        if not raw_home:
+            return None
+        return Path(raw_home) / SENT_MEDIA_STATE_FILENAME
 
 
 # ---------------------------------------------------------------------------
@@ -1377,6 +1414,8 @@ class LineAdapter(BasePlatformAdapter):
         self._sent_message_ids: Dict[str, float] = {}
         self._sent_message_context: Dict[str, Tuple[float, str]] = {}
         self._sent_message_media_context: Dict[str, Tuple[float, str, str]] = {}
+        self._sent_chat_media_context: Dict[str, Tuple[float, str, str]] = {}
+        self._sent_media_state_path: Optional[Path] = None
         self._group_chime_state: Dict[str, Dict[str, Any]] = {}
         self._group_recent_message_times: Dict[str, List[float]] = {}
         self._group_last_reply_at: Dict[str, float] = {}
@@ -1415,6 +1454,8 @@ class LineAdapter(BasePlatformAdapter):
             self._lock_key = None
 
         self._client = _LineClient(self.channel_access_token)
+        self._sent_media_state_path = _line_sent_media_state_path()
+        self._load_sent_media_state()
 
         # Best-effort: fetch our own bot userId for self-message filtering.
         # If the call fails (offline tests, transient 5xx) we fall back to
@@ -1499,6 +1540,8 @@ class LineAdapter(BasePlatformAdapter):
         self._sent_message_ids.clear()
         self._sent_message_context.clear()
         self._sent_message_media_context.clear()
+        self._sent_chat_media_context.clear()
+        self._sent_media_state_path = None
         self._group_chime_state.clear()
         self._group_recent_message_times.clear()
         self._group_last_reply_at.clear()
@@ -1650,7 +1693,8 @@ class LineAdapter(BasePlatformAdapter):
         else:
             text = f"[unsupported message type: {msg_type}]"
 
-        quoted_sent_message = self._is_replying_to_sent_message(msg)
+        quoted_chat_media = self._sent_chat_media_for_quote(msg, chat_id, text)
+        quoted_sent_message = self._is_replying_to_sent_message(msg) or bool(quoted_chat_media)
         quoted_sent_text = self._sent_message_text_for_quote(msg)
         quoted_sent_media = self._sent_message_media_for_quote(msg)
         chime_allowed, chime_reason = (
@@ -1690,6 +1734,11 @@ class LineAdapter(BasePlatformAdapter):
                 media_urls.append(local_path)
                 media_types.append(_line_media_type("image", local_path))
                 logger.info("LINE: attached quoted image content for message %s", message_id)
+            elif quoted_chat_media:
+                local_path, media_type = quoted_chat_media
+                media_urls.append(local_path)
+                media_types.append(media_type)
+                logger.info("LINE: attached recent outbound chat media for message %s", message_id)
 
         if chat_type == "group" and msg_type == "text" and not media_urls:
             recent_media = self._get_recent_group_media(chat_id, user_id)
@@ -1873,6 +1922,87 @@ class LineAdapter(BasePlatformAdapter):
             for message_id, (ts, path, media_type) in self._sent_message_media_context.items()
             if ts >= cutoff
         }
+        self._sent_chat_media_context = {
+            chat_id: (ts, path, media_type)
+            for chat_id, (ts, path, media_type) in self._sent_chat_media_context.items()
+            if ts >= cutoff and Path(path).is_file()
+        }
+
+    def _load_sent_media_state(self) -> None:
+        path = self._sent_media_state_path
+        if not path or not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.debug("LINE: could not load sent media state: %s", exc)
+            return
+        if not isinstance(payload, dict):
+            return
+
+        cutoff = time.time() - SENT_MESSAGE_ID_TTL_SECONDS
+        messages = payload.get("messages") if isinstance(payload.get("messages"), dict) else {}
+        chats = payload.get("chats") if isinstance(payload.get("chats"), dict) else {}
+
+        for message_id, item in messages.items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                ts = float(item.get("ts") or 0)
+            except (TypeError, ValueError):
+                continue
+            media_path = str(item.get("path") or "")
+            media_type = str(item.get("media_type") or "")
+            if ts < cutoff or not media_path or not media_type or not Path(media_path).is_file():
+                continue
+            self._sent_message_ids[str(message_id)] = ts
+            self._sent_message_media_context[str(message_id)] = (ts, media_path, media_type)
+
+        for chat_id, item in chats.items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                ts = float(item.get("ts") or 0)
+            except (TypeError, ValueError):
+                continue
+            media_path = str(item.get("path") or "")
+            media_type = str(item.get("media_type") or "")
+            if ts < cutoff or not media_path or not media_type or not Path(media_path).is_file():
+                continue
+            self._sent_chat_media_context[str(chat_id)] = (ts, media_path, media_type)
+
+    def _save_sent_media_state(self) -> None:
+        path = self._sent_media_state_path
+        if not path:
+            return
+        try:
+            self._prune_sent_message_ids()
+            payload = {
+                "version": 1,
+                "updated_at": time.time(),
+                "messages": {
+                    message_id: {
+                        "ts": ts,
+                        "path": media_path,
+                        "media_type": media_type,
+                    }
+                    for message_id, (ts, media_path, media_type) in self._sent_message_media_context.items()
+                },
+                "chats": {
+                    chat_id: {
+                        "ts": ts,
+                        "path": media_path,
+                        "media_type": media_type,
+                    }
+                    for chat_id, (ts, media_path, media_type) in self._sent_chat_media_context.items()
+                },
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.debug("LINE: could not save sent media state: %s", exc)
 
     def _remember_sent_messages(
         self,
@@ -1883,11 +2013,24 @@ class LineAdapter(BasePlatformAdapter):
     ) -> None:
         if not isinstance(sent_messages, list):
             return
-        if sent_messages:
-            self._mark_group_reply(chat_id)
         now = time.time()
         self._prune_sent_message_ids()
         original_messages = original_messages or []
+        if sent_messages or original_messages:
+            self._mark_group_reply(chat_id)
+        media_by_idx: Dict[int, Tuple[str, str]] = {}
+        state_changed = False
+        if chat_id:
+            for idx, original in enumerate(original_messages):
+                media_context = self._media_context_for_outgoing_message(original)
+                if media_context:
+                    media_by_idx[idx] = media_context
+                    self._sent_chat_media_context[chat_id] = (
+                        now,
+                        media_context[0],
+                        media_context[1],
+                    )
+                    state_changed = True
         for idx, item in enumerate(sent_messages):
             if not isinstance(item, dict):
                 continue
@@ -1898,13 +2041,14 @@ class LineAdapter(BasePlatformAdapter):
                     context = self._summarize_outgoing_message(original_messages[idx])
                     if context:
                         self._sent_message_context[message_id] = (now, context)
-                    media_context = self._media_context_for_outgoing_message(original_messages[idx])
+                    media_context = media_by_idx.get(idx) or self._media_context_for_outgoing_message(original_messages[idx])
                     if media_context:
                         self._sent_message_media_context[message_id] = (
                             now,
                             media_context[0],
                             media_context[1],
                         )
+                        state_changed = True
         if len(self._sent_message_ids) > 500:
             newest = sorted(self._sent_message_ids.items(), key=lambda kv: kv[1])[-500:]
             self._sent_message_ids = dict(newest)
@@ -1918,6 +2062,9 @@ class LineAdapter(BasePlatformAdapter):
                 for message_id in self._sent_message_ids
                 if message_id in self._sent_message_media_context
             }
+            state_changed = True
+        if state_changed:
+            self._save_sent_media_state()
 
     def _summarize_outgoing_message(self, message: Dict[str, Any]) -> str:
         msg_type = str((message or {}).get("type") or "")
@@ -1977,6 +2124,26 @@ class LineAdapter(BasePlatformAdapter):
         if not entry:
             return None
         return entry[1], entry[2]
+
+    def _sent_chat_media_for_quote(
+        self,
+        message: Dict[str, Any],
+        chat_id: str,
+        text: str,
+    ) -> Optional[Tuple[str, str]]:
+        if not chat_id:
+            return None
+        quoted_message_id = str((message or {}).get("quotedMessageId") or "").strip()
+        if not quoted_message_id or not _text_seems_to_reference_media(text):
+            return None
+        self._prune_sent_message_ids()
+        entry = self._sent_chat_media_context.get(chat_id)
+        if not entry:
+            return None
+        media_path = entry[1]
+        if not Path(media_path).is_file():
+            return None
+        return media_path, entry[2]
 
     def _mark_group_message_seen(self, chat_id: str) -> None:
         if not chat_id:

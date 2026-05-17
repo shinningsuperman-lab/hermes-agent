@@ -182,6 +182,52 @@ async def test_line_group_reply_to_sent_image_attaches_original_media(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_line_group_reply_to_recent_sent_image_falls_back_by_chat(monkeypatch, tmp_path):
+    image_path = tmp_path / "daisy-sticker.jpg"
+    image_path.write_bytes(b"fake-jpeg")
+
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter.public_base_url = "https://line.example.com"
+    adapter.group_trigger_keywords = ["@daisy"]
+    adapter.group_reply_mode = "mention_or_keyword"
+    token = adapter._register_media(str(image_path))
+    image_url = adapter._media_url(token, image_path.name)
+    adapter._remember_sent_messages(
+        [],
+        [{"type": "image", "originalContentUrl": image_url, "previewImageUrl": image_url}],
+        chat_id="C-test",
+    )
+    captured = []
+
+    async def fake_download_media(message_id, msg_type, filename="", *, warn=True):
+        return None
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "_download_media", fake_download_media)
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "C-test", "userId": "U-test"},
+            "message": {
+                "type": "text",
+                "id": "line-text-1",
+                "text": "把它存起來以後用",
+                "quotedMessageId": "unknown-line-image-id",
+            },
+        }
+    )
+
+    assert len(captured) == 1
+    assert captured[0].message_type is MessageType.PHOTO
+    assert captured[0].media_urls == [str(image_path.resolve())]
+    assert captured[0].media_types == ["image/jpeg"]
+
+
+@pytest.mark.asyncio
 async def test_line_group_text_reply_attaches_quoted_image(monkeypatch):
     adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
     adapter.group_trigger_keywords = ["@daisy"]
