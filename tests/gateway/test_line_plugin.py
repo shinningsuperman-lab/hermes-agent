@@ -42,6 +42,7 @@ _group_trigger_allowed = _line._group_trigger_allowed
 _message_mentions_self = _line._message_mentions_self
 _parse_sent_messages_body = _line._parse_sent_messages_body
 _strip_leading_group_trigger = _line._strip_leading_group_trigger
+_is_internal_notice = _line._is_internal_notice
 _is_system_bypass = _line._is_system_bypass
 RequestCache = _line.RequestCache
 State = _line.State
@@ -398,8 +399,14 @@ class TestSendRouting:
         assert _is_system_bypass("⚡ Interrupting current run")
         assert _is_system_bypass("⏳ Queued — agent is busy")
         assert _is_system_bypass("⏩ Steered toward new task")
+        assert not _is_system_bypass("💾 Self-improvement review: User profile updated")
         assert not _is_system_bypass("Hello world")
         assert not _is_system_bypass("")
+
+    def test_internal_notice_recognized(self):
+        assert _is_internal_notice("💾 Self-improvement review: User profile updated")
+        assert _is_internal_notice("Self-improvement review: Skill created")
+        assert not _is_internal_notice("hello")
 
     def test_send_uses_reply_when_token_present(self, adapter):
         import time as _time
@@ -454,6 +461,12 @@ class TestSendRouting:
         adapter._client.push.assert_called_once()
         # And the cache entry is unchanged (still PENDING for the eventual answer)
         assert adapter._cache.get(rid).state is State.PENDING
+
+    def test_send_internal_notice_is_suppressed(self, adapter):
+        result = asyncio.run(adapter.send("Uchat", "💾 Self-improvement review: User profile updated"))
+        assert result.success
+        adapter._client.reply.assert_not_called()
+        adapter._client.push.assert_not_called()
 
     def test_send_caps_messages_per_call_at_five(self, adapter):
         # Build a payload that would naturally split into more than 5 LINE

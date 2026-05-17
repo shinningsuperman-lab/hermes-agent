@@ -1117,7 +1117,6 @@ _SYSTEM_BYPASS_PREFIXES: Tuple[str, ...] = (
     "⚡ Interrupting",
     "⏳ Queued",
     "⏩ Steered",
-    "💾",  # background-review summary
 )
 
 
@@ -1125,6 +1124,18 @@ def _is_system_bypass(content: str) -> bool:
     if not content:
         return False
     return any(content.startswith(p) for p in _SYSTEM_BYPASS_PREFIXES)
+
+
+def _is_internal_notice(content: str) -> bool:
+    """Internal maintenance messages should stay in logs, not LINE chats."""
+    if not content:
+        return False
+    stripped = content.strip()
+    return (
+        stripped.startswith("💾")
+        or stripped.startswith("Self-improvement review:")
+        or "Self-improvement review:" in stripped
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2064,6 +2075,10 @@ class LineAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        if _is_internal_notice(content):
+            logger.info("LINE: suppressed internal notice for chat %s", chat_id)
+            return SendResult(success=True, message_id=None)
+
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
