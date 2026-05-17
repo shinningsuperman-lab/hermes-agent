@@ -141,6 +141,9 @@ LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
 DEFAULT_GROUP_MEDIA_CONTEXT_TTL_SECONDS = 0.0  # opt-in; preserves old behavior
 SENT_MESSAGE_ID_TTL_SECONDS = 86400  # lets quoted replies address the bot for 1 day
 SENT_MEDIA_STATE_FILENAME = "line-sent-media-context.json"
+LINE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+LINE_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
+LINE_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 
 GROUP_REPLY_MODES: Set[str] = {
     "always",
@@ -1844,24 +1847,17 @@ class LineAdapter(BasePlatformAdapter):
 
         if entry.state is State.READY:
             payload = entry.payload or ""
-            chunks = split_for_line(strip_markdown_preserving_urls(str(payload)))
-            messages = [_text_message(c) for c in chunks][:LINE_MAX_MESSAGES_PER_CALL]
+            messages = self._build_cached_payload_messages(str(payload))
+            if not messages:
+                messages = [_text_message(self.delivered_text)]
             try:
-                self._remember_sent_messages(
-                    await self._client.reply(reply_token, messages),
-                    messages,
-                    chat_id=chat_id,
-                )
+                await self._reply_then_push_messages(reply_token, chat_id, messages)
                 self._cache.mark_delivered(request_id)
                 self._pending_buttons.pop(chat_id, None)
             except Exception as exc:
                 logger.warning("LINE: postback reply failed (%s); falling back to push", exc)
                 try:
-                    self._remember_sent_messages(
-                        await self._client.push(chat_id, messages),
-                        messages,
-                        chat_id=chat_id,
-                    )
+                    await self._push_message_batches(chat_id, messages)
                     self._cache.mark_delivered(request_id)
                     self._pending_buttons.pop(chat_id, None)
                 except Exception as exc2:
@@ -1900,6 +1896,154 @@ class LineAdapter(BasePlatformAdapter):
                 )
             except Exception:
                 pass
+
+    async def _reply_then_push_messages(
+        self,
+        reply_token: str,
+        chat_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        if not self._client:
+            raise RuntimeError("LINE adapter not connected")
+        if not messages:
+            return
+
+        first_batch = messages[:LINE_MAX_MESSAGES_PER_CALL]
+        rest = messages[LINE_MAX_MESSAGES_PER_CALL:]
+        self._remember_sent_messages(
+            await self._client.reply(reply_token, first_batch),
+            first_batch,
+            chat_id=chat_id,
+        )
+        while rest:
+            batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
+            rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
+            self._remember_sent_messages(
+                await self._client.push(chat_id, batch),
+                batch,
+                chat_id=chat_id,
+            )
+
+    async def _push_message_batches(
+        self,
+        chat_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        if not self._client:
+            raise RuntimeError("LINE adapter not connected")
+        rest = list(messages)
+        while rest:
+            batch = rest[:LINE_MAX_MESSAGES_PER_CALL]
+            rest = rest[LINE_MAX_MESSAGES_PER_CALL:]
+            self._remember_sent_messages(
+                await self._client.push(chat_id, batch),
+                batch,
+                chat_id=chat_id,
+            )
+
+    def _cache_pending_response(self, chat_id: str, content: str) -> Optional[str]:
+        request_id = self._pending_buttons.get(chat_id)
+        if not request_id:
+            return None
+        entry = self._cache.get(request_id)
+        if not entry:
+            self._pending_buttons.pop(chat_id, None)
+            return None
+
+        content = str(content or "").strip()
+        if not content:
+            return request_id
+        if entry.state is State.PENDING:
+            self._cache.set_ready(request_id, content)
+            return request_id
+        if entry.state is State.READY:
+            existing = str(entry.payload or "").strip()
+            entry.payload = f"{existing}\n\n{content}".strip() if existing else content
+            entry.updated_at = time.time()
+            return request_id
+        return None
+
+    def _build_cached_payload_messages(self, payload: str) -> List[Dict[str, Any]]:
+        media_files, cleaned = self.extract_media(payload)
+        images, text_content = self.extract_images(cleaned)
+        text_content = text_content.replace("[[audio_as_voice]]", "").strip()
+        text_content = text_content.replace("[[as_document]]", "").strip()
+        text_content = re.sub(r"MEDIA:\s*\S+", "", text_content).strip()
+        local_files, text_content = self.extract_local_files(text_content)
+
+        messages: List[Dict[str, Any]] = []
+        chunks = split_for_line(strip_markdown_preserving_urls(text_content))
+        messages.extend(_text_message(chunk) for chunk in chunks)
+
+        for url, alt_text in images:
+            clean_url = str(url or "").strip()
+            if clean_url.lower().startswith("https://"):
+                messages.append(_image_message(clean_url))
+            elif clean_url:
+                label = str(alt_text or "").strip()
+                messages.append(_text_message(f"{label}\n{clean_url}".strip()))
+
+        for media_path, is_voice in media_files:
+            message = self._line_message_for_local_media(media_path, is_voice=is_voice)
+            if message:
+                messages.append(message)
+
+        for file_path in local_files:
+            message = self._line_message_for_local_media(file_path, is_voice=False)
+            if message:
+                messages.append(message)
+
+        return messages
+
+    def _line_message_for_local_media(
+        self,
+        media_path: str,
+        *,
+        is_voice: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        path = Path(os.path.expanduser(str(media_path or "")))
+        if not path.exists() or not path.is_file():
+            logger.warning("LINE: cached media file not found: %s", media_path)
+            return None
+
+        ext = path.suffix.lower()
+        if ext in LINE_IMAGE_EXTS and path.stat().st_size > LINE_IMAGE_MAX_BYTES:
+            logger.warning("LINE: cached image exceeds 10 MB LINE limit: %s", path)
+            return None
+        if ext in (LINE_AUDIO_EXTS | LINE_VIDEO_EXTS) and path.stat().st_size > LINE_AV_MAX_BYTES:
+            logger.warning("LINE: cached media exceeds 200 MB LINE limit: %s", path)
+            return None
+
+        try:
+            serving_path = self._stage_media_file_for_serving(path)
+        except Exception as exc:
+            logger.warning("LINE: could not stage cached media for LINE: %s", exc)
+            return None
+
+        token = self._register_media(str(serving_path))
+        url = self._media_url(token, serving_path.name)
+        if not url.lower().startswith("https://"):
+            logger.warning("LINE: cached media URL must be HTTPS: %s", url)
+            return None
+
+        if ext in LINE_IMAGE_EXTS:
+            return _image_message(url)
+        if ext in LINE_AUDIO_EXTS or is_voice:
+            return _audio_message(url)
+        if ext in LINE_VIDEO_EXTS:
+            preview_token = self._register_media(self._ensure_video_preview_file(), cleanup=True)
+            preview_url = self._media_url(preview_token, "preview.png")
+            return _video_message(url, preview_url)
+        return None
+
+    def _ensure_video_preview_file(self) -> str:
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        try:
+            tmp.write(_FALLBACK_PNG_PREVIEW)
+            tmp.flush()
+            return tmp.name
+        finally:
+            tmp.close()
 
     def _prune_group_media_context(self, chat_id: str) -> None:
         ttl = max(0.0, float(self.group_media_context_ttl or 0.0))
@@ -2370,9 +2514,8 @@ class LineAdapter(BasePlatformAdapter):
 
         # If the chat has a PENDING postback button outstanding, route the
         # response into the cache for the user to fetch via tap.
-        pending_rid = self._pending_buttons.get(chat_id)
+        pending_rid = self._cache_pending_response(chat_id, content)
         if pending_rid:
-            self._cache.set_ready(pending_rid, content)
             return SendResult(success=True, message_id=pending_rid)
 
         return await self._send_text_chunks(chat_id, content, force_push=False)
@@ -2619,6 +2762,9 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"image file not found: {image_path}")
         if path.stat().st_size > LINE_IMAGE_MAX_BYTES:
             return SendResult(success=False, error="image exceeds 10 MB LINE limit")
+        pending_rid = self._cache_pending_response(chat_id, f"MEDIA:{path}")
+        if pending_rid:
+            return SendResult(success=True, message_id=pending_rid)
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
         if not self.public_base_url and self.webhook_host == "0.0.0.0":
@@ -2654,6 +2800,10 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"audio file not found: {audio_path}")
         if path.stat().st_size > LINE_AV_MAX_BYTES:
             return SendResult(success=False, error="audio exceeds 200 MB LINE limit")
+        prefix = "[[audio_as_voice]]\n" if Path(audio_path).suffix.lower() in {".ogg", ".opus"} else ""
+        pending_rid = self._cache_pending_response(chat_id, f"{prefix}MEDIA:{path}")
+        if pending_rid:
+            return SendResult(success=True, message_id=pending_rid)
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
         if not self.public_base_url and self.webhook_host == "0.0.0.0":
@@ -2683,6 +2833,9 @@ class LineAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"video file not found: {video_path}")
         if path.stat().st_size > LINE_AV_MAX_BYTES:
             return SendResult(success=False, error="video exceeds 200 MB LINE limit")
+        pending_rid = self._cache_pending_response(chat_id, f"MEDIA:{path}")
+        if pending_rid:
+            return SendResult(success=True, message_id=pending_rid)
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
         if not self.public_base_url and self.webhook_host == "0.0.0.0":

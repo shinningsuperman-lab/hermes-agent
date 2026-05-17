@@ -390,3 +390,115 @@ async def test_line_group_chime_handles_implicit_image_request(monkeypatch):
     assert captured[0].text == "幫我看一下這張成績"
     assert captured[0].message_type is MessageType.PHOTO
     assert captured[0].media_urls == ["/tmp/line-image-1.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_line_postback_ready_delivers_cached_media(monkeypatch, tmp_path):
+    image_path = tmp_path / "xiao-si.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    cache_dir = tmp_path / "line-media"
+
+    class FakeLineClient:
+        def __init__(self):
+            self.replies = []
+            self.pushes = []
+
+        async def reply(self, reply_token, messages):
+            self.replies.append((reply_token, messages))
+            return [{"id": f"reply-{idx}"} for idx, _ in enumerate(messages)]
+
+        async def push(self, chat_id, messages):
+            self.pushes.append((chat_id, messages))
+            return [{"id": f"push-{idx}"} for idx, _ in enumerate(messages)]
+
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter._client = FakeLineClient()
+    adapter.public_base_url = "https://line.example.com"
+    monkeypatch.setattr(
+        line_adapter,
+        "_line_media_allowed_roots",
+        lambda: {tmp_path.resolve(), cache_dir.resolve()},
+    )
+    monkeypatch.setattr(line_adapter, "_line_media_cache_dir", lambda: cache_dir)
+
+    request_id = adapter._cache.register_pending("U-test")
+    adapter._pending_buttons["U-test"] = request_id
+    adapter._cache.set_ready(request_id, f"好了\n\nMEDIA:{image_path}")
+
+    await adapter._handle_postback_event(
+        {
+            "replyToken": "reply-token",
+            "source": {"type": "user", "userId": "U-test"},
+            "postback": {
+                "data": '{"action":"show_response","request_id":"%s"}' % request_id
+            },
+        }
+    )
+
+    assert len(adapter._client.replies) == 1
+    _reply_token, messages = adapter._client.replies[0]
+    assert _reply_token == "reply-token"
+    assert [message["type"] for message in messages] == ["text", "image"]
+    image_url = messages[1]["originalContentUrl"]
+    assert image_url.startswith("https://line.example.com/line/media/")
+    token = adapter._media_token_from_url(image_url)
+    served_path, _expires_at = adapter._media_tokens[token]
+    assert Path(served_path).resolve() == image_path.resolve()
+    assert adapter._cache.get(request_id).state is line_adapter.State.DELIVERED
+    assert "U-test" not in adapter._pending_buttons
+
+
+@pytest.mark.asyncio
+async def test_line_pending_postback_caches_image_file_until_tap(monkeypatch, tmp_path):
+    image_path = tmp_path / "reaction.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+    cache_dir = tmp_path / "line-media"
+
+    class FakeLineClient:
+        def __init__(self):
+            self.replies = []
+            self.pushes = []
+
+        async def reply(self, reply_token, messages):
+            self.replies.append((reply_token, messages))
+            return [{"id": f"reply-{idx}"} for idx, _ in enumerate(messages)]
+
+        async def push(self, chat_id, messages):
+            self.pushes.append((chat_id, messages))
+            return [{"id": f"push-{idx}"} for idx, _ in enumerate(messages)]
+
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter._client = FakeLineClient()
+    adapter.public_base_url = "https://line.example.com"
+    monkeypatch.setattr(
+        line_adapter,
+        "_line_media_allowed_roots",
+        lambda: {tmp_path.resolve(), cache_dir.resolve()},
+    )
+    monkeypatch.setattr(line_adapter, "_line_media_cache_dir", lambda: cache_dir)
+
+    request_id = adapter._cache.register_pending("U-test")
+    adapter._pending_buttons["U-test"] = request_id
+
+    result = await adapter.send_image_file("U-test", str(image_path))
+
+    assert result.success
+    assert result.message_id == request_id
+    assert adapter._client.replies == []
+    assert adapter._client.pushes == []
+    entry = adapter._cache.get(request_id)
+    assert entry.state is line_adapter.State.READY
+    assert f"MEDIA:{image_path}" in entry.payload
+
+    await adapter._handle_postback_event(
+        {
+            "replyToken": "reply-token",
+            "source": {"type": "user", "userId": "U-test"},
+            "postback": {
+                "data": '{"action":"show_response","request_id":"%s"}' % request_id
+            },
+        }
+    )
+
+    assert len(adapter._client.replies) == 1
+    assert adapter._client.replies[0][1][0]["type"] == "image"
