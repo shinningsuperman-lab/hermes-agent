@@ -71,6 +71,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import tempfile
 import textwrap
 import time
@@ -994,7 +995,47 @@ def _line_sent_media_state_path() -> Optional[Path]:
         raw_home = os.getenv("HERMES_HOME", "").strip()
         if not raw_home:
             return None
-        return Path(raw_home) / SENT_MEDIA_STATE_FILENAME
+    return Path(raw_home) / SENT_MEDIA_STATE_FILENAME
+
+
+def _line_media_cache_dir() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        hermes_home = Path(get_hermes_home())
+    except Exception:
+        raw_home = os.getenv("HERMES_HOME", "").strip()
+        hermes_home = Path(raw_home) if raw_home else Path.home() / ".hermes"
+    return hermes_home / "cache" / "line-media"
+
+
+def _line_media_allowed_roots() -> Set[Path]:
+    try:
+        from hermes_constants import get_hermes_home
+        hermes_home = Path(get_hermes_home()).resolve()
+    except Exception:
+        raw_home = os.getenv("HERMES_HOME", "").strip()
+        hermes_home = Path(raw_home).resolve() if raw_home else (Path.home() / ".hermes").resolve()
+    return {
+        Path(tempfile.gettempdir()).resolve(),
+        Path("/tmp").resolve(),  # → /private/tmp on macOS
+        hermes_home,
+    }
+
+
+def _media_safe_filename(path: Path) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", path.stem).strip(".-") or "media"
+    stem = stem[:80]
+    suffix = path.suffix if path.suffix else ".bin"
+    stat = path.stat()
+    digest = hashlib.sha256(
+        f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{stem}-{digest}{suffix}"
+
+
+def _path_is_line_media_servable(path: Path) -> bool:
+    resolved = path.resolve()
+    return any(_is_relative_to(resolved, root) for root in _line_media_allowed_roots())
 
 
 # ---------------------------------------------------------------------------
@@ -2503,6 +2544,18 @@ class LineAdapter(BasePlatformAdapter):
             self._media_temp_paths.add(resolved)
         return token
 
+    def _stage_media_file_for_serving(self, path: Path) -> Path:
+        resolved = path.resolve()
+        if _path_is_line_media_servable(resolved):
+            return resolved
+
+        cache_dir = _line_media_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        target = cache_dir / _media_safe_filename(resolved)
+        if not target.exists() or target.stat().st_size != resolved.stat().st_size:
+            shutil.copy2(resolved, target)
+        return target.resolve()
+
     def _media_url(self, token: str, filename: str) -> str:
         """Build the public HTTPS URL for a media token. PR #8398 style."""
         if self.public_base_url:
@@ -2542,17 +2595,7 @@ class LineAdapter(BasePlatformAdapter):
         if not path.exists() or not path.is_file():
             return web.Response(status=404, text="not found")
 
-        try:
-            from hermes_constants import get_hermes_home
-            hermes_home = Path(get_hermes_home()).resolve()
-        except Exception:
-            hermes_home = Path.home().joinpath(".hermes").resolve()
-
-        allowed_roots = {
-            Path(tempfile.gettempdir()).resolve(),
-            Path("/tmp").resolve(),  # → /private/tmp on macOS
-            hermes_home,
-        }
+        allowed_roots = _line_media_allowed_roots()
         resolved = path.resolve()
         if not any(_is_relative_to(resolved, r) for r in allowed_roots):
             logger.warning("LINE: refusing to serve outside allowed roots: %s", resolved)
@@ -2585,8 +2628,13 @@ class LineAdapter(BasePlatformAdapter):
                 "(LINE only accepts publicly reachable HTTPS URLs)",
             )
 
-        token = self._register_media(str(path.resolve()))
-        url = self._media_url(token, path.name)
+        try:
+            serving_path = self._stage_media_file_for_serving(path)
+        except Exception as exc:
+            return SendResult(success=False, error=f"could not stage image for LINE: {exc}")
+
+        token = self._register_media(str(serving_path))
+        url = self._media_url(token, serving_path.name)
         if not url.lower().startswith("https://"):
             return SendResult(success=False, error=f"LINE image URL must be HTTPS: {url}")
         msgs: List[Dict[str, Any]] = [_image_message(url)]
@@ -2614,8 +2662,13 @@ class LineAdapter(BasePlatformAdapter):
                 error="LINE_PUBLIC_URL must be set to send audio",
             )
 
-        token = self._register_media(str(path.resolve()))
-        url = self._media_url(token, path.name)
+        try:
+            serving_path = self._stage_media_file_for_serving(path)
+        except Exception as exc:
+            return SendResult(success=False, error=f"could not stage audio for LINE: {exc}")
+
+        token = self._register_media(str(serving_path))
+        url = self._media_url(token, serving_path.name)
         return await self._send_messages(chat_id, [_audio_message(url, duration_ms)])
 
     async def send_video(
@@ -2641,8 +2694,12 @@ class LineAdapter(BasePlatformAdapter):
         # LINE requires a previewImageUrl. Use one if supplied, otherwise
         # write a stdlib 1×1 PNG to /tmp and serve it. PR #8398.
         if preview_path and Path(preview_path).is_file():
-            preview_token = self._register_media(str(Path(preview_path).resolve()))
-            preview_filename = Path(preview_path).name
+            try:
+                preview_serving_path = self._stage_media_file_for_serving(Path(preview_path))
+            except Exception as exc:
+                return SendResult(success=False, error=f"could not stage video preview for LINE: {exc}")
+            preview_token = self._register_media(str(preview_serving_path))
+            preview_filename = preview_serving_path.name
         else:
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             try:
@@ -2658,8 +2715,13 @@ class LineAdapter(BasePlatformAdapter):
                     pass
                 raise
 
-        video_token = self._register_media(str(path.resolve()))
-        video_url = self._media_url(video_token, path.name)
+        try:
+            video_serving_path = self._stage_media_file_for_serving(path)
+        except Exception as exc:
+            return SendResult(success=False, error=f"could not stage video for LINE: {exc}")
+
+        video_token = self._register_media(str(video_serving_path))
+        video_url = self._media_url(video_token, video_serving_path.name)
         preview_url = self._media_url(preview_token, preview_filename)
         return await self._send_messages(chat_id, [_video_message(video_url, preview_url)])
 

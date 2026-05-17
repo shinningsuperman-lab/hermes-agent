@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -225,6 +226,48 @@ async def test_line_group_reply_to_recent_sent_image_falls_back_by_chat(monkeypa
     assert captured[0].message_type is MessageType.PHOTO
     assert captured[0].media_urls == [str(image_path.resolve())]
     assert captured[0].media_types == ["image/jpeg"]
+
+
+@pytest.mark.asyncio
+async def test_line_send_image_file_stages_unservable_path(monkeypatch, tmp_path):
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    image_path = external_dir / "reaction.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+    allowed_dir = tmp_path / "allowed"
+    cache_dir = tmp_path / "home" / "cache" / "line-media"
+    allowed_dir.mkdir()
+
+    class FakeLineClient:
+        def __init__(self):
+            self.messages = None
+
+        async def push(self, chat_id, messages):
+            self.messages = messages
+            return [{"id": "sent-image-1"}]
+
+    fake_client = FakeLineClient()
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter._client = fake_client
+    adapter.public_base_url = "https://line.example.com"
+
+    monkeypatch.setattr(
+        line_adapter,
+        "_line_media_allowed_roots",
+        lambda: {allowed_dir.resolve()},
+    )
+    monkeypatch.setattr(line_adapter, "_line_media_cache_dir", lambda: cache_dir)
+
+    result = await adapter.send_image_file("U-test", str(image_path))
+
+    assert result.success
+    assert fake_client.messages
+    image_url = fake_client.messages[0]["originalContentUrl"]
+    token = adapter._media_token_from_url(image_url)
+    staged_path, _ = adapter._media_tokens[token]
+    assert str(cache_dir.resolve()) in staged_path
+    assert image_path.read_bytes() == Path(staged_path).read_bytes()
 
 
 @pytest.mark.asyncio
