@@ -304,6 +304,23 @@ class TestRequestCache:
         # No longer PENDING — should not be found
         assert c.find_pending_for_chat("Ua") is None
 
+    def test_state_file_preserves_ready_payload(self, tmp_path):
+        state_path = tmp_path / "line-postback-cache.json"
+        c = RequestCache(state_path=state_path)
+        rid = c.register_pending("Uchat")
+        c.set_ready(rid, "the answer")
+        c.append_ready_payload(rid, "MEDIA:/tmp/reaction.png")
+
+        restored = RequestCache(state_path=state_path)
+
+        assert restored.get(rid).state is State.READY
+        assert restored.get(rid).chat_id == "Uchat"
+        assert restored.get(rid).payload == "the answer\n\nMEDIA:/tmp/reaction.png"
+
+        restored.mark_delivered(rid)
+        delivered = RequestCache(state_path=state_path)
+        assert delivered.get(rid).state is State.DELIVERED
+
 
 # ---------------------------------------------------------------------------
 # 6. Markdown stripping + chunking

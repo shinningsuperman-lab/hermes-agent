@@ -141,6 +141,7 @@ LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
 DEFAULT_GROUP_MEDIA_CONTEXT_TTL_SECONDS = 0.0  # opt-in; preserves old behavior
 SENT_MESSAGE_ID_TTL_SECONDS = 86400  # lets quoted replies address the bot for 1 day
 SENT_MEDIA_STATE_FILENAME = "line-sent-media-context.json"
+POSTBACK_CACHE_STATE_FILENAME = "line-postback-cache.json"
 LINE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 LINE_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
 LINE_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
@@ -611,25 +612,92 @@ class _CacheEntry:
 
 
 class RequestCache:
-    """In-memory cache for slow-LLM postback retrieval.
+    """Cache for slow-LLM postback retrieval.
 
     PRs #18153 originally combined two TTLs — one for PENDING (24h) and
     a shorter one for READY/DELIVERED/ERROR (1h). We keep the same model
-    here.
+    here. A state file can be attached by the live adapter so READY
+    postback buttons survive gateway restarts.
     """
 
     def __init__(
         self,
         ttl_seconds: int = 3600,
         pending_ttl_seconds: int = 86400,
+        state_path: Optional[Path] = None,
     ) -> None:
         self._entries: Dict[str, _CacheEntry] = {}
         self._ttl = ttl_seconds
         self._pending_ttl = pending_ttl_seconds
+        self._state_path = state_path
+        self._load()
+
+    def _load(self) -> None:
+        path = self._state_path
+        if not path or not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.debug("LINE: could not load postback cache state: %s", exc)
+            return
+        entries = payload.get("entries") if isinstance(payload, dict) else None
+        if not isinstance(entries, dict):
+            return
+
+        loaded: Dict[str, _CacheEntry] = {}
+        for request_id, item in entries.items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                state = State(str(item.get("state") or ""))
+            except ValueError:
+                continue
+            try:
+                created_at = float(item.get("created_at") or time.time())
+                updated_at = float(item.get("updated_at") or created_at)
+            except (TypeError, ValueError):
+                created_at = updated_at = time.time()
+            loaded[str(request_id)] = _CacheEntry(
+                state=state,
+                payload=item.get("payload"),
+                chat_id=str(item.get("chat_id") or ""),
+                created_at=created_at,
+                updated_at=updated_at,
+            )
+        self._entries = loaded
+        self.prune()
+
+    def _save(self) -> None:
+        path = self._state_path
+        if not path:
+            return
+        try:
+            payload = {
+                "version": 1,
+                "updated_at": time.time(),
+                "entries": {
+                    request_id: {
+                        "state": entry.state.value,
+                        "payload": entry.payload,
+                        "chat_id": entry.chat_id,
+                        "created_at": entry.created_at,
+                        "updated_at": entry.updated_at,
+                    }
+                    for request_id, entry in self._entries.items()
+                },
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.debug("LINE: could not save postback cache state: %s", exc)
 
     def register_pending(self, chat_id: str) -> str:
         rid = str(uuid.uuid4())
         self._entries[rid] = _CacheEntry(state=State.PENDING, chat_id=chat_id)
+        self._save()
         return rid
 
     def get(self, request_id: str) -> Optional[_CacheEntry]:
@@ -642,6 +710,7 @@ class RequestCache:
         entry.state = State.READY
         entry.payload = payload
         entry.updated_at = time.time()
+        self._save()
 
     def set_error(self, request_id: str, message: str) -> None:
         entry = self._entries.get(request_id)
@@ -650,6 +719,7 @@ class RequestCache:
         entry.state = State.ERROR
         entry.payload = message
         entry.updated_at = time.time()
+        self._save()
 
     def mark_delivered(self, request_id: str) -> None:
         entry = self._entries.get(request_id)
@@ -657,6 +727,20 @@ class RequestCache:
             return
         entry.state = State.DELIVERED
         entry.updated_at = time.time()
+        self._save()
+
+    def append_ready_payload(self, request_id: str, payload: Any) -> bool:
+        entry = self._entries.get(request_id)
+        if entry is None or entry.state is not State.READY:
+            return False
+        existing = str(entry.payload or "").strip()
+        addition = str(payload or "").strip()
+        if not addition:
+            return True
+        entry.payload = f"{existing}\n\n{addition}".strip() if existing else addition
+        entry.updated_at = time.time()
+        self._save()
+        return True
 
     def find_pending_for_chat(self, chat_id: str) -> Optional[str]:
         for rid, entry in self._entries.items():
@@ -677,6 +761,8 @@ class RequestCache:
                 if now - entry.updated_at > self._ttl:
                     del self._entries[rid]
                     removed += 1
+        if removed:
+            self._save()
         return removed
 
 
@@ -999,6 +1085,17 @@ def _line_sent_media_state_path() -> Optional[Path]:
         if not raw_home:
             return None
     return Path(raw_home) / SENT_MEDIA_STATE_FILENAME
+
+
+def _line_postback_cache_path() -> Optional[Path]:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()) / POSTBACK_CACHE_STATE_FILENAME
+    except Exception:
+        raw_home = os.getenv("HERMES_HOME", "").strip()
+        if not raw_home:
+            return None
+    return Path(raw_home) / POSTBACK_CACHE_STATE_FILENAME
 
 
 def _line_media_cache_dir() -> Path:
@@ -1498,6 +1595,7 @@ class LineAdapter(BasePlatformAdapter):
             self._lock_key = None
 
         self._client = _LineClient(self.channel_access_token)
+        self._cache = RequestCache(state_path=_line_postback_cache_path())
         self._sent_media_state_path = _line_sent_media_state_path()
         self._load_sent_media_state()
 
@@ -1957,9 +2055,7 @@ class LineAdapter(BasePlatformAdapter):
             self._cache.set_ready(request_id, content)
             return request_id
         if entry.state is State.READY:
-            existing = str(entry.payload or "").strip()
-            entry.payload = f"{existing}\n\n{content}".strip() if existing else content
-            entry.updated_at = time.time()
+            self._cache.append_ready_payload(request_id, content)
             return request_id
         return None
 
