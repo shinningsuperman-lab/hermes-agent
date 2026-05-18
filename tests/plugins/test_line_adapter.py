@@ -502,3 +502,30 @@ async def test_line_pending_postback_caches_image_file_until_tap(monkeypatch, tm
 
     assert len(adapter._client.replies) == 1
     assert adapter._client.replies[0][1][0]["type"] == "image"
+
+
+@pytest.mark.asyncio
+async def test_line_new_message_clears_finished_pending_button(monkeypatch):
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    request_id = adapter._cache.register_pending("U-test")
+    adapter._pending_buttons["U-test"] = request_id
+    adapter._cache.set_ready(request_id, "舊答案")
+    captured = []
+
+    async def fake_handle_message(event):
+        assert "U-test" not in adapter._pending_buttons
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token",
+            "source": {"type": "user", "userId": "U-test"},
+            "message": {"type": "text", "id": "line-text-1", "text": "下一題"},
+        }
+    )
+
+    assert len(captured) == 1
+    assert adapter._cache.get(request_id).state is line_adapter.State.READY
+    assert adapter._cache.get(request_id).payload == "舊答案"

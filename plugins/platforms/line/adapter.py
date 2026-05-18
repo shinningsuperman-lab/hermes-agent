@@ -1778,6 +1778,7 @@ class LineAdapter(BasePlatformAdapter):
         source = event.get("source") or {}
         chat_id, chat_type = _resolve_chat(source)
         user_id = source.get("userId", "") or chat_id
+        self._clear_finished_pending_button(chat_id)
         if chat_type == "group":
             self._mark_group_message_seen(chat_id)
 
@@ -1994,6 +1995,14 @@ class LineAdapter(BasePlatformAdapter):
                 )
             except Exception:
                 pass
+
+    def _clear_finished_pending_button(self, chat_id: str) -> None:
+        request_id = self._pending_buttons.get(chat_id)
+        if not request_id:
+            return
+        entry = self._cache.get(request_id)
+        if entry is None or entry.state in (State.READY, State.ERROR, State.DELIVERED):
+            self._pending_buttons.pop(chat_id, None)
 
     async def _reply_then_push_messages(
         self,
