@@ -103,51 +103,47 @@ def build_steps(bot: str | None) -> list[tuple[str, list[str], Path]]:
         steps.extend(
             [
                 (
-                    "BUBU bridge syntax check",
+                    "BUBU Nixie runtime syntax check",
                     [
                         sys.executable,
                         "-c",
                         (
                             "import ast,pathlib;"
-                            "ast.parse(pathlib.Path('/Users/vc/.openclaw/scripts/hermes-bubu-line-proxy.py').read_text())"
+                            "ast.parse(pathlib.Path('/Users/vc/Library/Application Support/bubu-line-agent/runtime/codex_line_proxy.py').read_text())"
                         ),
                     ],
                     HERMES_ROOT,
                 ),
                 (
-                    "BUBU group trigger contract",
+                    "BUBU Nixie runtime contract",
                     [
                         sys.executable,
                         "-c",
                         (
-                            "import runpy;"
-                            "ns=runpy.run_path('/Users/vc/.openclaw/scripts/hermes-bubu-line-proxy.py');"
-                            "assert ns['_group_trigger_allowed']('小布 看一下', {}, 'G1')[0];"
-                            "assert ns['_group_trigger_allowed']('hi', {'mention': {'mentionees': [{'isSelf': True}]}}, 'G1')[0];"
-                            "assert ns['_group_trigger_allowed']('幫我記一下 28 號再 PK', {}, 'G1')[0];"
-                            "assert not ns['_group_trigger_allowed']('hi', {}, 'G1')[0]"
+                            "import pathlib;"
+                            "text=pathlib.Path('/Users/vc/Library/Application Support/bubu-line-agent/runtime/codex_line_proxy.py').read_text();"
+                            "needles=['_filter_user_visible_messages','_USER_VISIBLE_SYSTEM_STATUS_RE','CLI error','hit your limit','_should_reply_to_event','_message_mentions_self','_find_group_trigger_keyword','_record_group_chime','mention_keyword_or_chime'];"
+                            "missing=[needle for needle in needles if needle not in text];"
+                            "assert not missing, missing"
                         ),
                     ],
                     HERMES_ROOT,
                 ),
                 (
-                    "BUBU system status suppression contract",
+                    "BUBU Nixie runtime smoke check",
                     [
                         sys.executable,
-                        "-c",
-                        (
-                            "import runpy;"
-                            "ns=runpy.run_path('/Users/vc/.openclaw/scripts/hermes-bubu-line-proxy.py');"
-                            "sample=\"[CLI error: You've hit your limit - resets 6:20pm (Asia/Taipei)]\";"
-                            "assert ns['TECHNICAL_FAILURE_PATTERNS'].search(sample);"
-                            "assert ns['PROVIDER_LIMIT_PATTERNS'].search(sample);"
-                            "assert ns['suppress_system_status_text'](sample)==''"
-                        ),
+                        "/Users/vc/nixie-lab/scripts/runtime_smoke_check.py",
+                        "--instance",
+                        "bubu|/Users/vc/Library/Application Support/bubu-line-agent/runtime|18794|https://bubu.shinningsuperman.com",
+                        "--skip-local",
+                        "--skip-public",
+                        "--json",
                     ],
                     HERMES_ROOT,
                 ),
                 (
-                    "BUBU bridge audit",
+                    "BUBU shared-core audit",
                     [hermes_py, "scripts/bot_regression_audit.py", "--bot", "bubu"],
                     HERMES_ROOT,
                 ),

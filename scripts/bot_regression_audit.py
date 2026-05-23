@@ -23,9 +23,8 @@ HERMES_ROOT = Path("/Users/vc/codex/hermes-agent-latest")
 XIAOWEI_PROFILE = Path("/Users/vc/.hermes/profiles/wechat")
 DAISY_PROFILE = Path("/Users/vc/.hermes/profiles/daisy")
 NIKITA_PROFILE = Path("/Users/vc/.hermes/profiles/nikita")
-BUBU_HERMES_HOME = Path("/Users/vc/.hermes-bubu")
 BUBU_RUNTIME_ROOT = Path("/Users/vc/Library/Application Support/bubu-line-agent")
-BUBU_PROXY_SCRIPT = Path("/Users/vc/.openclaw/scripts/hermes-bubu-line-proxy.py")
+BUBU_RUNTIME = BUBU_RUNTIME_ROOT / "runtime"
 NIXIE_RUNTIME = Path("/Users/vc/Library/Application Support/nixie-lab-agent/runtime")
 NIXIE_LAB_SOURCE = Path("/Users/vc/nixie-lab")
 
@@ -64,12 +63,19 @@ HERMES_LINE_GROUP_NEEDLES = [
 ]
 
 BUBU_GROUP_NEEDLES = [
-    "GROUP_REPLY_MODE",
-    "GROUP_CHIME_IN_ENABLED",
+    "_should_reply_to_event",
     "_message_mentions_self",
-    "_group_trigger_allowed",
+    "_find_group_trigger_keyword",
     "_group_chime_score",
-    "_strip_group_trigger",
+    "_record_group_chime",
+    "mention_keyword_or_chime",
+]
+
+BUBU_RUNTIME_NEEDLES = [
+    "_filter_user_visible_messages",
+    "_USER_VISIBLE_SYSTEM_STATUS_RE",
+    "CLI error",
+    "hit your limit",
 ]
 
 NIXIE_GROUP_NEEDLES = [
@@ -512,41 +518,45 @@ def nikita_report(since_mtime: float | None = None) -> BotReport:
 
 def bubu_report(since_mtime: float | None = None) -> BotReport:
     checks: list[Check] = []
-    checks.append(check("ok" if BUBU_HERMES_HOME.exists() else "fail", "hermes home", str(BUBU_HERMES_HOME)))
-    checks.append(check("ok" if BUBU_RUNTIME_ROOT.exists() else "warn", "runtime root", str(BUBU_RUNTIME_ROOT)))
-    checks.append(check("ok" if BUBU_PROXY_SCRIPT.exists() else "fail", "line proxy", str(BUBU_PROXY_SCRIPT)))
-    checks.append(launchd_state("com.openclaw.hermes-bubu-line-proxy"))
-    checks.append(local_health(18794, "/healthz"))
+    checks.append(check("ok" if BUBU_RUNTIME_ROOT.exists() else "fail", "runtime root", str(BUBU_RUNTIME_ROOT)))
+    checks.append(check("ok" if BUBU_RUNTIME.exists() else "fail", "nixie runtime", str(BUBU_RUNTIME)))
+    checks.append(check("ok" if (BUBU_RUNTIME / ".secrets").exists() else "fail", "runtime secrets", str(BUBU_RUNTIME / ".secrets")))
+    checks.append(launchd_state("com.vc.bubu-codex-line-proxy"))
 
-    script_text = read_text(BUBU_PROXY_SCRIPT)
-    needed_filters = [
-        "suppress_system_status_text",
-        "No response from provider",
-        "Retrying in",
-        "Still working",
-        "Interrupting current task",
-        "Command approved",
-        "Dangerous command requires approval",
-        "Self-improvement review",
-        "Cron job .*failed",
-        "CLI error",
-        "hit your limit",
-    ]
-    missing_filters = [needle for needle in needed_filters if needle not in script_text]
+    secrets = load_json(BUBU_RUNTIME / ".secrets")
+    port = 18794
+    if isinstance(secrets, dict):
+        configured_port = secrets.get("line_agent_port")
+        if isinstance(configured_port, int):
+            port = configured_port
+        elif isinstance(configured_port, str) and configured_port.isdigit():
+            port = int(configured_port)
+        bot_id = str(secrets.get("bot_id") or "")
+        display_name = str(secrets.get("bot_display_name") or "")
+        if bot_id == "bubu" and display_name:
+            checks.append(check("ok", "runtime identity", f"BUBU shared-core identity is {display_name}."))
+        else:
+            checks.append(check("warn", "runtime identity", "BUBU runtime .secrets is missing expected bot_id/display name."))
+    else:
+        checks.append(check("fail", "runtime identity", "BUBU runtime .secrets is not valid JSON."))
+    checks.append(local_health(port, "/healthz"))
+
+    runtime_text = read_text(BUBU_RUNTIME / "codex_line_proxy.py")
+    missing_filters = [needle for needle in BUBU_RUNTIME_NEEDLES if needle not in runtime_text]
     if missing_filters:
-        checks.append(check("warn", "system-status filter", "BUBU bridge is missing some status suppression patterns.", missing_filters))
+        checks.append(check("warn", "system-status filter", "BUBU Nixie runtime is missing some status suppression markers.", missing_filters))
     else:
-        checks.append(check("ok", "system-status filter", "BUBU bridge filters Hermes/Codex status output before LINE delivery."))
+        checks.append(check("ok", "system-status filter", "BUBU Nixie runtime filters Codex status output before LINE delivery."))
 
-    missing_group = [needle for needle in BUBU_GROUP_NEEDLES if needle not in script_text]
+    missing_group = [needle for needle in BUBU_GROUP_NEEDLES if needle not in runtime_text]
     if missing_group:
-        checks.append(check("warn", "group trigger contract", "BUBU bridge is missing group-chat trigger primitives.", missing_group))
+        checks.append(check("warn", "group trigger contract", "BUBU Nixie runtime is missing group-chat trigger primitives.", missing_group))
     else:
-        checks.append(check("ok", "group trigger contract", "BUBU bridge supports keyword, native mention, and conservative group chime gates."))
+        checks.append(check("ok", "group trigger contract", "BUBU Nixie runtime supports keyword, native mention, and conservative group chime gates."))
 
     files = (
-        recent_files(BUBU_HERMES_HOME / "sessions", ["*.jsonl"], max_files=20, since_mtime=since_mtime)
-        + recent_files(BUBU_RUNTIME_ROOT / "data", ["*.jsonl"], max_files=20, since_mtime=since_mtime)
+        recent_files(BUBU_RUNTIME_ROOT / "data", ["*.jsonl"], max_files=20, since_mtime=since_mtime)
+        + recent_files(BUBU_RUNTIME / "memory", ["*.md", "*.jsonl"], max_files=20, since_mtime=since_mtime)
     )
     checks.append(
         summarize_scan(

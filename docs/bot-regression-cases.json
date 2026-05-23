@@ -396,7 +396,7 @@
     },
     {
       "id": "BUBU-001",
-      "title": "BUBU bridge is healthy and filters Hermes status output",
+      "title": "BUBU Nixie shared-core runtime is healthy and filters status output",
       "bots": ["bubu"],
       "priority": "P0",
       "mode": "offline",
@@ -404,15 +404,15 @@
         {"run": "python3 scripts/bot_regression_audit.py --bot bubu"}
       ],
       "expected": [
-        "BUBU bridge launchd service is running.",
+        "BUBU shared-core launchd service com.vc.bubu-codex-line-proxy is running.",
         "Local health endpoint answers.",
-        "Bridge filter removes provider timeout, retry, approval, self-improvement, command-status, and CLI limit lines before LINE delivery."
+        "Nixie runtime filter removes provider timeout, retry, approval, self-improvement, command-status, and CLI limit lines before LINE delivery."
       ],
       "pass_criteria": [
         "Health endpoint is OK.",
         "Audit says system-status filter is OK."
       ],
-      "evidence": ["audit output", "/tmp/openclaw/hermes-bubu-line-proxy*.log"]
+      "evidence": ["audit output", "/tmp/bubu-line-agent/line-proxy.log"]
     },
     {
       "id": "NIXIE-001",
