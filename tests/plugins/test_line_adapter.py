@@ -12,6 +12,27 @@ def test_line_image_message_type_normalizes_to_photo():
     assert line_adapter._line_media_type("image") == "image/jpeg"
 
 
+def test_line_incoming_quote_context_persists(tmp_path):
+    state_path = tmp_path / "line-incoming-context.json"
+    quoted_text = "T長官 23號週六先取消了\n沒人，28號長庚再來 PK"
+
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter._incoming_context_state_path = state_path
+    adapter._remember_incoming_message_context("line-prev-1", "C-test", quoted_text)
+
+    reloaded = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    reloaded._incoming_context_state_path = state_path
+    reloaded._load_incoming_message_context()
+
+    assert (
+        reloaded._incoming_message_text_for_quote(
+            {"quotedMessageId": "line-prev-1"},
+            "C-test",
+        )
+        == quoted_text
+    )
+
+
 @pytest.mark.asyncio
 async def test_line_image_message_event_uses_photo_and_image_mime(monkeypatch):
     adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
@@ -138,6 +159,49 @@ async def test_line_group_reply_to_sent_message_triggers_without_keyword(monkeyp
     assert captured[0].text == "這個是什麼意思"
     assert captured[0].reply_to_message_id == "daisy-message-1"
     assert captured[0].reply_to_text == "這是 Daisy 前一則回覆"
+
+
+@pytest.mark.asyncio
+async def test_line_group_reply_to_recent_incoming_message_supplies_quote_text(monkeypatch):
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter.group_trigger_keywords = ["@daisy"]
+    adapter.group_reply_mode = "mention_or_keyword"
+    quoted_text = "T長官 23號週六先取消了\n沒人，28號長庚再來 PK"
+    captured = []
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token-1",
+            "source": {"type": "group", "groupId": "C-test", "userId": "U-test"},
+            "message": {
+                "type": "text",
+                "id": "line-prev-1",
+                "text": quoted_text,
+            },
+        }
+    )
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token-2",
+            "source": {"type": "group", "groupId": "C-test", "userId": "U-test"},
+            "message": {
+                "type": "text",
+                "id": "line-text-1",
+                "text": "@daisy 記起來喔",
+                "quotedMessageId": "line-prev-1",
+            },
+        }
+    )
+
+    assert len(captured) == 1
+    assert captured[0].text == "記起來喔"
+    assert captured[0].reply_to_message_id == "line-prev-1"
+    assert captured[0].reply_to_text == quoted_text
 
 
 @pytest.mark.asyncio
@@ -390,6 +454,37 @@ async def test_line_group_chime_handles_implicit_image_request(monkeypatch):
     assert captured[0].text == "幫我看一下這張成績"
     assert captured[0].message_type is MessageType.PHOTO
     assert captured[0].media_urls == ["/tmp/line-image-1.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_line_group_chime_handles_golf_schedule_change(monkeypatch):
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter.group_trigger_keywords = ["@daisy"]
+    adapter.group_reply_mode = "mention_keyword_or_chime"
+    adapter.group_chime_in_enabled = True
+    adapter.group_chime_in_cooldown_seconds = 0
+    adapter.group_chime_in_min_score = 3
+    captured = []
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "C-test", "userId": "U-test"},
+            "message": {
+                "type": "text",
+                "id": "line-text-1",
+                "text": "T長官 23號週六先取消了\n沒人，28號長庚再來 PK",
+            },
+        }
+    )
+
+    assert len(captured) == 1
+    assert captured[0].text == "T長官 23號週六先取消了\n沒人，28號長庚再來 PK"
 
 
 @pytest.mark.asyncio

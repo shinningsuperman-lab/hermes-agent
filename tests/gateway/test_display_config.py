@@ -157,6 +157,13 @@ class TestYAMLNormalisation:
         config = {"display": {"platforms": {"telegram": {"show_reasoning": "true"}}}}
         assert resolve_display_setting(config, "telegram", "show_reasoning") is True
 
+    def test_status_messages_false_normalised(self):
+        """Gateway lifecycle/status bubbles can be disabled for chat platforms."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"platforms": {"weixin": {"status_messages": False}}}}
+        assert resolve_display_setting(config, "weixin", "status_messages") is False
+
     def test_tool_preview_length_string(self):
         """String numbers are normalised to int."""
         from gateway.display_config import resolve_display_setting

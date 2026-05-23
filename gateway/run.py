@@ -51,7 +51,7 @@ from typing import Dict, Optional, Any, List, Union
 # preserving the established test-patch surface.
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
-from agent.i18n import t
+from agent.i18n import get_language, t
 from hermes_cli.config import cfg_get
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -173,6 +173,324 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return float(default)
+
+
+_FULLWIDTH_DIGIT_TRANSLATION = str.maketrans({
+    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+})
+
+
+def _platform_key(platform: Any) -> str:
+    value = getattr(platform, "value", platform)
+    return str(value or "").strip().lower()
+
+
+def _is_xiaowei_wechat_profile(platform: Any) -> bool:
+    """Return True for the user's 小薇 WeChat profile.
+
+    小薇 has a durable todo store outside the agent's in-session `todo`
+    tool.  Keep this profile-specific so other gateways keep their normal
+    planning-tool behavior.
+    """
+    return (
+        _platform_key(platform) == "weixin"
+        and _hermes_home.expanduser().resolve()
+        == Path("/Users/vc/.hermes/profiles/wechat").resolve()
+    )
+
+
+def _open_xiaowei_todos() -> list[dict]:
+    path = _hermes_home / "data" / "todos.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to read 小薇 todos from %s", path, exc_info=True)
+        return []
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        return []
+    return [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("status", "open")).lower() in {"open", "pending"}
+        and str(item.get("content", "")).strip()
+    ]
+
+
+def _format_xiaowei_todos(*, title: str = "目前待辦") -> str:
+    items = _open_xiaowei_todos()
+    if not items:
+        return f"閃亮超人，{title}沒有未完成項目。"
+    lines = [f"閃亮超人，{title}有 {len(items)} 項：", ""]
+    for idx, item in enumerate(items, start=1):
+        content = str(item.get("content", "")).strip()
+        lines.append(f"{idx}. **{content}**")
+    return "\n".join(lines)
+
+
+def _normalize_xiaowei_todo_query(text: str) -> str:
+    return re.sub(r"[\s　。！？!?，,：:]+", "", text or "")
+
+
+def _extract_xiaowei_todo_add(text: str) -> Optional[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    patterns = (
+        r"^待辦(?:事項)?[：:]\s*(.+)$",
+        r"^新增待辦[：:]\s*(.+)$",
+        r"^加入待辦[：:]\s*(.+)$",
+        r"^記到待辦[：:]\s*(.+)$",
+        r"^列入待辦[：:]\s*(.+)$",
+        r"^待辦\s+(.+)$",
+        r"^待辦事項\s+(.+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            content = match.group(1).strip()
+            if content:
+                return content
+    return None
+
+
+def _has_xiaowei_todo_intent(text: str) -> bool:
+    raw = (text or "").strip().lower()
+    if not raw:
+        return False
+    normalized = _normalize_xiaowei_todo_query(raw)
+    return "待辦" in normalized or "todo" in raw or "to-do" in raw
+
+
+def _is_xiaowei_todo_query(text: str) -> bool:
+    normalized = _normalize_xiaowei_todo_query(text)
+    if normalized in {
+        "待辦",
+        "待辦事項",
+        "待辦清單",
+        "目前待辦",
+        "今日待辦",
+        "今天待辦",
+        "待辦呢",
+        "今日待辦呢",
+        "今天待辦呢",
+        "再發一次待辦",
+        "再發待辦",
+    }:
+        return True
+    return "待辦" in normalized and len(normalized) <= 12
+
+
+def _xiaowei_todo_title_for_query(text: str) -> str:
+    normalized = _normalize_xiaowei_todo_query(text)
+    return "今日待辦" if ("今日" in normalized or "今天" in normalized) else "目前待辦"
+
+
+def _add_xiaowei_todo(content: str, *, category: str = "General") -> str:
+    path = _hermes_home / "data" / "todos.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {
+            "version": 1,
+            "items": [],
+        }
+    except Exception:
+        logger.warning("Failed to read 小薇 todos for update from %s", path, exc_info=True)
+        data = {"version": 1, "items": []}
+    if not isinstance(data.get("items"), list):
+        data["items"] = []
+
+    def _norm(value: str) -> str:
+        return re.sub(r"\s+", " ", value.strip()).lower()
+
+    wanted = _norm(content)
+    for item in data["items"]:
+        if isinstance(item, dict) and _norm(str(item.get("content", ""))) == wanted:
+            if str(item.get("status", "open")).lower() not in {"done", "completed", "cancelled"}:
+                return f"已經在待辦裡了：\n- **{item.get('content', content)}**"
+
+    import hashlib
+    from datetime import timezone, timedelta
+
+    now = datetime.now(timezone(timedelta(hours=8)))
+    digest = hashlib.sha1(wanted.encode("utf-8")).hexdigest()[:10]
+    data["items"].append({
+        "id": f"todo-{digest}",
+        "content": content.strip(),
+        "status": "open",
+        "category": category,
+        "created_at": now.strftime("%Y-%m-%d"),
+    })
+    data["updated_at"] = now.isoformat(timespec="seconds")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return f"已列入待辦：\n- **{content.strip()}**"
+
+
+def _handle_xiaowei_todo_batch(text: str) -> Optional[str]:
+    """Handle one or more Xiaowei todo commands in a single chat bubble."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    added: list[str] = []
+    duplicate_or_status: list[str] = []
+    query_title: str | None = None
+    handled = 0
+
+    for line in lines:
+        item = _extract_xiaowei_todo_add(line)
+        if item:
+            result = _add_xiaowei_todo(item)
+            handled += 1
+            if result.startswith("已經"):
+                duplicate_or_status.append(result)
+            else:
+                added.append(item.strip())
+            continue
+        if _is_xiaowei_todo_query(line):
+            query_title = _xiaowei_todo_title_for_query(line)
+            handled += 1
+            continue
+        return None
+
+    if handled == 0:
+        return None
+
+    if query_title:
+        parts: list[str] = []
+        if added:
+            if len(added) == 1:
+                parts.append(f"已列入待辦，閃亮超人：\n- **{added[0]}**")
+            else:
+                parts.append("已列入待辦，閃亮超人：\n" + "\n".join(f"- **{item}**" for item in added))
+        if duplicate_or_status and not added:
+            parts.append("\n".join(duplicate_or_status))
+        parts.append(_format_xiaowei_todos(title=query_title))
+        return "\n\n".join(part for part in parts if part.strip())
+
+    if len(added) == 1 and not duplicate_or_status:
+        return f"已列入待辦：\n- **{added[0]}**"
+    if added:
+        return "已列入待辦：\n" + "\n".join(f"- **{item}**" for item in added)
+    if duplicate_or_status:
+        return "\n".join(duplicate_or_status)
+    return None
+
+
+def _sync_xiaowei_todos_from_agent_messages(
+    messages: List[Dict[str, Any]],
+    *,
+    trigger_text: str = "",
+) -> int:
+    """Mirror accidental in-session `todo` tool writes into Xiaowei's store.
+
+    Xiaowei's personal todo list is durable (`data/todos.json`). The built-in
+    `todo` tool is an in-session planning tool, but models may still use it
+    when the user phrases a task in a way the gateway shortcut did not catch.
+    Sync only when the original user text clearly has todo intent so ordinary
+    agent planning does not pollute the personal list.
+    """
+    if not _has_xiaowei_todo_intent(trigger_text):
+        return 0
+
+    synced = 0
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        if str(msg.get("name") or "").strip() != "todo":
+            continue
+        try:
+            payload = json.loads(str(msg.get("content") or "{}"))
+        except Exception:
+            continue
+        todos = payload.get("todos") if isinstance(payload, dict) else None
+        if not isinstance(todos, list):
+            continue
+        for item in todos:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status", "pending")).lower()
+            if status in {"completed", "done", "cancelled"}:
+                continue
+            content = str(item.get("content") or "").strip()
+            if not content:
+                continue
+            before_count = len(_open_xiaowei_todos())
+            _add_xiaowei_todo(content, category="Migrated session todo")
+            if len(_open_xiaowei_todos()) > before_count:
+                synced += 1
+    if synced:
+        logger.info("Synced %d 小薇 in-session todo item(s) into durable store", synced)
+    return synced
+
+
+def _truthy_config(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if text in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return bool(value)
+
+
+def _shorten_approval_path(path: str) -> str:
+    cleaned = path.strip().strip("'\"")
+    if not cleaned:
+        return cleaned
+    marker = "/workspace/"
+    if marker in cleaned:
+        return cleaned.split(marker, 1)[1]
+    home = str(Path.home())
+    if cleaned == home:
+        return "~"
+    if cleaned.startswith(home + "/"):
+        return "~/" + cleaned[len(home) + 1:]
+    return cleaned
+
+
+def _approval_command_summary(command: str, *, lang: str) -> str:
+    cmd = (command or "").strip()
+    if not cmd:
+        return ""
+
+    redirect = re.search(r"(?:^|\s)(>>?|2>|&>)\s*([^;&|]+)", cmd)
+    if redirect:
+        op = redirect.group(1)
+        target = _shorten_approval_path(redirect.group(2))
+        if lang.startswith("zh"):
+            action = "追加寫入" if op == ">>" else "寫入"
+            return f"{action}：{target}"
+        action = "Append to" if op == ">>" else "Write to"
+        return f"{action}: {target}"
+
+    return cmd[:180] + ("..." if len(cmd) > 180 else "")
+
+
+def _approval_reason_summary(description: str, *, lang: str) -> str:
+    desc = (description or "").strip()
+    if not desc:
+        return "需要確認" if lang.startswith("zh") else "needs confirmation"
+    if lang.startswith("zh"):
+        lowered = desc.lower()
+        if "confusable unicode" in lowered:
+            return "文字安全檢查（含中文或相似字元）"
+        if "security scan" in lowered:
+            return "安全檢查"
+        if desc == "dangerous command":
+            return "危險指令"
+    return desc[:140] + ("..." if len(desc) > 140 else "")
 
 
 def _is_fresh_gateway_interruption(
@@ -6003,6 +6321,12 @@ class GatewayRunner:
             _tool_approval_live = has_blocking_approval(_quick_key)
         except Exception:
             _tool_approval_live = False
+        _approval_shortcut_result = await self._handle_exec_approval_shortcut_if_pending(
+            event,
+            _tool_approval_live,
+        )
+        if _approval_shortcut_result is not None:
+            return _approval_shortcut_result
         if _pending_confirm and not _tool_approval_live:
             _raw_reply = (event.text or "").strip()
             _cmd_reply = event.get_command()
@@ -6028,6 +6352,21 @@ class GatewayRunner:
             # the confirm doesn't block normal usage indefinitely.  The user
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
+
+        # 小薇 WeChat durable todo shortcut.
+        #
+        # The built-in `todo` tool is intentionally in-session state.  For the
+        # user's 小薇 persona, "待辦/今日待辦" is a durable personal list that
+        # also feeds the 09:00 cron digest.  Intercept simple todo add/list
+        # utterances before the agent loop so the model cannot accidentally
+        # read the stale session `todo` list and report only two items.
+        if _is_xiaowei_wechat_profile(source.platform):
+            _todo_text = (event.text or "").strip()
+            if _todo_text and not _todo_text.startswith("/"):
+                _todo_batch = _handle_xiaowei_todo_batch(_todo_text)
+                if _todo_batch is not None:
+                    logger.info("小薇 durable todo shortcut: %s", _todo_text[:80])
+                    return _todo_batch
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
@@ -7999,6 +8338,15 @@ class GatewayRunner:
             else:
                 history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
+
+                if _is_xiaowei_wechat_profile(source.platform):
+                    try:
+                        _sync_xiaowei_todos_from_agent_messages(
+                            new_messages,
+                            trigger_text=event.text or message_text,
+                        )
+                    except Exception as _todo_sync_exc:
+                        logger.warning("小薇 durable todo sync failed: %s", _todo_sync_exc)
 
                 # If no new messages found (edge case), fall back to simple user/assistant
                 if not new_messages:
@@ -12528,6 +12876,129 @@ class GatewayRunner:
         except Exception:
             return {}
 
+    def _display_setting_for_source(
+        self,
+        source,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+        cfg = self._read_user_config()
+        display = cfg.get("display") if isinstance(cfg, dict) else None
+        if not isinstance(display, dict):
+            return default
+
+        platform_display = None
+        platform_key = _platform_key(getattr(source, "platform", None))
+        platforms = display.get("platforms")
+        if isinstance(platforms, dict):
+            candidate = platforms.get(platform_key)
+            if isinstance(candidate, dict):
+                platform_display = candidate
+
+        if platform_display is not None and key in platform_display:
+            return platform_display.get(key)
+        return display.get(key, default)
+
+    def _approval_numeric_shortcuts_enabled(self, source) -> bool:
+        return _truthy_config(
+            self._display_setting_for_source(
+                source,
+                "approval_numeric_shortcuts",
+                default=False,
+            ),
+            default=False,
+        )
+
+    def _approval_ack_enabled(self, source) -> bool:
+        return _truthy_config(
+            self._display_setting_for_source(
+                source,
+                "approval_ack_enabled",
+                default=True,
+            ),
+            default=True,
+        )
+
+    def _approval_prompt_style(self, source) -> str:
+        raw = self._display_setting_for_source(
+            source,
+            "approval_prompt_style",
+            default="full",
+        )
+        return str(raw or "full").strip().lower()
+
+    def _format_exec_approval_message(
+        self,
+        source,
+        command: str,
+        description: str,
+    ) -> str:
+        lang = get_language()
+        compact = self._approval_prompt_style(source) in {"compact", "short", "brief"}
+        numeric = self._approval_numeric_shortcuts_enabled(source)
+        cmd_summary = _approval_command_summary(command, lang=lang)
+        reason = _approval_reason_summary(description, lang=lang)
+
+        if lang.startswith("zh"):
+            if compact:
+                lines = ["⚠️ 需要批准", f"原因：{reason}"]
+                if cmd_summary:
+                    lines.append(f"動作：{cmd_summary}")
+                lines.append("")
+                lines.append("回覆 1 同意，2 拒絕。" if numeric else "回覆 /approve 同意，/deny 拒絕。")
+                return "\n".join(lines)
+
+            cmd_preview = (command or "")[:200] + ("..." if len(command or "") > 200 else "")
+            action_hint = (
+                "回覆 `1` 或 `/approve` 執行；回覆 `2` 或 `/deny` 取消。"
+                if numeric
+                else "回覆 `/approve` 執行，或 `/deny` 取消。"
+            )
+            return (
+                "⚠️ 危險指令需要批准：\n"
+                f"```\n{cmd_preview}\n```\n"
+                f"原因：{reason}\n\n"
+                f"{action_hint}"
+            )
+
+        if compact:
+            lines = ["⚠️ Approval needed", f"Reason: {reason}"]
+            if cmd_summary:
+                lines.append(f"Action: {cmd_summary}")
+            lines.append("")
+            lines.append("Reply 1 to approve, 2 to deny." if numeric else "Reply /approve to approve, /deny to deny.")
+            return "\n".join(lines)
+
+        cmd_preview = (command or "")[:200] + ("..." if len(command or "") > 200 else "")
+        action_hint = (
+            "Reply `1` or `/approve` to execute, `2` or `/deny` to cancel."
+            if numeric
+            else "Reply `/approve` to execute, `/approve session` to approve this pattern "
+                 "for the session, `/approve always` to approve permanently, or `/deny` to cancel."
+        )
+        return (
+            f"⚠️ **Dangerous command requires approval:**\n"
+            f"```\n{cmd_preview}\n```\n"
+            f"Reason: {description}\n\n"
+            f"{action_hint}"
+        )
+
+    async def _handle_exec_approval_shortcut_if_pending(
+        self,
+        event: MessageEvent,
+        approval_live: bool,
+    ) -> Optional[str]:
+        if not approval_live or not self._approval_numeric_shortcuts_enabled(event.source):
+            return None
+
+        raw = (event.text or "").strip().translate(_FULLWIDTH_DIGIT_TRANSLATION)
+        raw = raw.strip().strip(".。!！")
+        if raw == "1":
+            return await self._handle_approve_command(event)
+        if raw == "2":
+            return await self._handle_deny_command(event)
+        return None
+
     def _thread_metadata_for_source(
         self,
         source,
@@ -12615,6 +13086,8 @@ class GatewayRunner:
             _adapter.resume_typing_for_chat(source.chat_id)
 
         logger.info("User approved %d dangerous command(s) via /approve (%s)", count, choice)
+        if not self._approval_ack_enabled(source):
+            return ""
         plural = "plural" if count > 1 else "singular"
         return t(f"gateway.approve.{choice}_{plural}", count=count)
 
@@ -12652,6 +13125,8 @@ class GatewayRunner:
             _adapter.resume_typing_for_chat(source.chat_id)
 
         logger.info("User denied %d dangerous command(s) via /deny", count)
+        if not self._approval_ack_enabled(source):
+            return ""
         if count > 1:
             return t("gateway.deny.denied_plural", count=count)
         return t("gateway.deny.denied_singular")
@@ -14655,6 +15130,9 @@ class GatewayRunner:
         _cleanup_progress = bool(
             resolve_display_setting(user_config, platform_key, "cleanup_progress")
         )
+        _status_messages_enabled = bool(
+            resolve_display_setting(user_config, platform_key, "status_messages", True)
+        )
         _cleanup_adapter = self.adapters.get(source.platform) if _cleanup_progress else None
         if _cleanup_adapter is not None and (
             type(_cleanup_adapter).delete_message is BasePlatformAdapter.delete_message
@@ -15059,6 +15537,14 @@ class GatewayRunner:
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
+                return
+            if not _status_messages_enabled:
+                logger.debug(
+                    "Suppressed status_callback delivery for %s/%s: %s",
+                    source.platform.value if source.platform else "?",
+                    event_type,
+                    message,
+                )
                 return
             _fut = safe_schedule_threadsafe(
                 _status_adapter.send(
@@ -15581,15 +16067,8 @@ class GatewayRunner:
                             "Button-based approval failed, falling back to text: %s", _e
                         )
 
-                # Fallback: plain text approval prompt
-                cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
-                msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
-                    f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
-                    f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                    f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
-                )
+                # Fallback: plain text approval prompt.
+                msg = self._format_exec_approval_message(source, cmd, desc)
                 try:
                     _approval_send_fut = safe_schedule_threadsafe(
                         _status_adapter.send(

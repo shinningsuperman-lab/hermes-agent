@@ -141,6 +141,7 @@ LINE_AV_MAX_BYTES = 200 * 1024 * 1024  # 200 MB for voice/video
 DEFAULT_GROUP_MEDIA_CONTEXT_TTL_SECONDS = 0.0  # opt-in; preserves old behavior
 SENT_MESSAGE_ID_TTL_SECONDS = 86400  # lets quoted replies address the bot for 1 day
 SENT_MEDIA_STATE_FILENAME = "line-sent-media-context.json"
+INCOMING_CONTEXT_STATE_FILENAME = "line-incoming-context.json"
 POSTBACK_CACHE_STATE_FILENAME = "line-postback-cache.json"
 LINE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 LINE_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
@@ -205,6 +206,10 @@ GROUP_CHIME_ASSISTANT_TASK_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
         r"摘要",
         r"分析",
         r"判斷",
+        r"記一下",
+        r"記起來",
+        r"幫.*記",
+        r"存起來",
         r"翻譯",
         r"轉成",
         r"弄成",
@@ -223,6 +228,14 @@ GROUP_CHIME_GOLF_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
         r"誰贏",
         r"桿數",
         r"球局",
+        r"高爾夫",
+        r"打球",
+        r"球場",
+        r"開球",
+        r"tee\s*time",
+        r"(?:長庚|桃園|老爺|統帥).{0,16}(?:\d{1,2}[:：]\d{2}|[A-Z]?TV|PK|確定|取消|改期|延期|開球)",
+        r"(?:\d{1,2}\s*(?:/|月|號)|週[一二三四五六日天]).{0,24}(?:長庚|桃園|老爺|統帥|球場|PK)",
+        r"(?:取消|改期|延期|沒人|再來).{0,24}(?:長庚|桃園|老爺|統帥|球場|PK|球局)",
     )
 )
 
@@ -257,6 +270,9 @@ GROUP_CHIME_COORDINATION_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(
         r"誰方便",
         r"誰有空",
         r"要訂嗎",
+        r"(?:取消|改期|延期|沒人|再來|改到).{0,24}(?:長庚|桃園|老爺|統帥|球場|PK|打球|球局)",
+        r"(?:長庚|桃園|老爺|統帥|球場|PK).{0,24}(?:取消|改期|延期|沒人|再來|確定)",
+        r"\d{1,2}\s*(?:/|月|號).{0,24}(?:取消|改期|延期|確定|長庚|桃園|老爺|統帥|球場|PK)",
     )
 )
 
@@ -1087,6 +1103,17 @@ def _line_sent_media_state_path() -> Optional[Path]:
     return Path(raw_home) / SENT_MEDIA_STATE_FILENAME
 
 
+def _line_incoming_context_state_path() -> Optional[Path]:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()) / INCOMING_CONTEXT_STATE_FILENAME
+    except Exception:
+        raw_home = os.getenv("HERMES_HOME", "").strip()
+        if not raw_home:
+            return None
+    return Path(raw_home) / INCOMING_CONTEXT_STATE_FILENAME
+
+
 def _line_postback_cache_path() -> Optional[Path]:
     try:
         from hermes_constants import get_hermes_home
@@ -1315,6 +1342,21 @@ def _is_system_bypass(content: str) -> bool:
     return any(content.startswith(p) for p in _SYSTEM_BYPASS_PREFIXES)
 
 
+_INTERNAL_NOTICE_RE = re.compile(
+    r"(?:"
+    r"Self-improvement review|"
+    r"No response from provider|non-streaming|Aborting call|Retrying in|"
+    r"Still working|Interrupting current task|iteration\s+\d+/\d+|running:\s*[\w.-]+|"
+    r"Command approved|Dangerous command requires approval|requires approval|"
+    r"Cron job\b.*\bfailed|prompt matches threat pattern|deception_hide|"
+    r"CLI error|You've hit your limit|hit your limit|"
+    r"resets?\s+.*(?:Asia/Taipei|UTC|PST|PDT|EST|EDT)|"
+    r"exit code\s+\d+|provider=|base_url=|model=|API call failed|Connection error|Traceback|HTTPError"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _is_internal_notice(content: str) -> bool:
     """Internal maintenance messages should stay in logs, not LINE chats."""
     if not content:
@@ -1324,6 +1366,7 @@ def _is_internal_notice(content: str) -> bool:
         stripped.startswith("💾")
         or stripped.startswith("Self-improvement review:")
         or "Self-improvement review:" in stripped
+        or bool(_INTERNAL_NOTICE_RE.search(stripped))
     )
 
 
@@ -1556,7 +1599,9 @@ class LineAdapter(BasePlatformAdapter):
         self._sent_message_context: Dict[str, Tuple[float, str]] = {}
         self._sent_message_media_context: Dict[str, Tuple[float, str, str]] = {}
         self._sent_chat_media_context: Dict[str, Tuple[float, str, str]] = {}
+        self._incoming_message_context: Dict[str, Tuple[float, str, str]] = {}
         self._sent_media_state_path: Optional[Path] = None
+        self._incoming_context_state_path: Optional[Path] = None
         self._group_chime_state: Dict[str, Dict[str, Any]] = {}
         self._group_recent_message_times: Dict[str, List[float]] = {}
         self._group_last_reply_at: Dict[str, float] = {}
@@ -1597,7 +1642,9 @@ class LineAdapter(BasePlatformAdapter):
         self._client = _LineClient(self.channel_access_token)
         self._cache = RequestCache(state_path=_line_postback_cache_path())
         self._sent_media_state_path = _line_sent_media_state_path()
+        self._incoming_context_state_path = _line_incoming_context_state_path()
         self._load_sent_media_state()
+        self._load_incoming_message_context()
 
         # Best-effort: fetch our own bot userId for self-message filtering.
         # If the call fails (offline tests, transient 5xx) we fall back to
@@ -1683,7 +1730,9 @@ class LineAdapter(BasePlatformAdapter):
         self._sent_message_context.clear()
         self._sent_message_media_context.clear()
         self._sent_chat_media_context.clear()
+        self._incoming_message_context.clear()
         self._sent_media_state_path = None
+        self._incoming_context_state_path = None
         self._group_chime_state.clear()
         self._group_recent_message_times.clear()
         self._group_last_reply_at.clear()
@@ -1836,9 +1885,13 @@ class LineAdapter(BasePlatformAdapter):
         else:
             text = f"[unsupported message type: {msg_type}]"
 
+        if msg_type == "text":
+            self._remember_incoming_message_context(message_id, chat_id, text)
+
         quoted_chat_media = self._sent_chat_media_for_quote(msg, chat_id, text)
         quoted_sent_message = self._is_replying_to_sent_message(msg) or bool(quoted_chat_media)
         quoted_sent_text = self._sent_message_text_for_quote(msg)
+        quoted_incoming_text = self._incoming_message_text_for_quote(msg, chat_id)
         quoted_sent_media = self._sent_message_media_for_quote(msg)
         chime_allowed, chime_reason = (
             self._should_group_chime_in(chat_id, user_id, msg, text)
@@ -1914,7 +1967,7 @@ class LineAdapter(BasePlatformAdapter):
             raw_message=event,
             message_id=message_id,
             reply_to_message_id=quoted_message_id or None,
-            reply_to_text=quoted_sent_text or None,
+            reply_to_text=quoted_sent_text or quoted_incoming_text or None,
             media_urls=media_urls,
             media_types=media_types,
         )
@@ -2194,6 +2247,103 @@ class LineAdapter(BasePlatformAdapter):
         requester_entries = [entry for entry in entries if user_id and entry[1] == user_id]
         entry = (requester_entries or entries)[-1]
         return entry[2], entry[3]
+
+    def _prune_incoming_message_context(self) -> None:
+        cutoff = time.time() - SENT_MESSAGE_ID_TTL_SECONDS
+        self._incoming_message_context = {
+            message_id: (ts, chat_id, text)
+            for message_id, (ts, chat_id, text) in self._incoming_message_context.items()
+            if ts >= cutoff
+        }
+
+    def _remember_incoming_message_context(
+        self,
+        message_id: str,
+        chat_id: str,
+        text: str,
+    ) -> None:
+        clean_message_id = str(message_id or "").strip()
+        clean_text = str(text or "").strip()
+        if not clean_message_id or not chat_id or not clean_text:
+            return
+        self._prune_incoming_message_context()
+        self._incoming_message_context[clean_message_id] = (
+            time.time(),
+            chat_id,
+            clean_text[:1000],
+        )
+        if len(self._incoming_message_context) > 1000:
+            newest = sorted(
+                self._incoming_message_context.items(),
+                key=lambda kv: kv[1][0],
+            )[-1000:]
+            self._incoming_message_context = dict(newest)
+        self._save_incoming_message_context()
+
+    def _incoming_message_text_for_quote(
+        self,
+        message: Dict[str, Any],
+        chat_id: str,
+    ) -> str:
+        quoted_message_id = str((message or {}).get("quotedMessageId") or "").strip()
+        if not quoted_message_id or not chat_id:
+            return ""
+        self._prune_incoming_message_context()
+        entry = self._incoming_message_context.get(quoted_message_id)
+        if not entry or entry[1] != chat_id:
+            return ""
+        return entry[2]
+
+    def _load_incoming_message_context(self) -> None:
+        path = self._incoming_context_state_path
+        if not path or not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.debug("LINE: could not load incoming context state: %s", exc)
+            return
+        if not isinstance(payload, dict):
+            return
+        cutoff = time.time() - SENT_MESSAGE_ID_TTL_SECONDS
+        messages = payload.get("messages") if isinstance(payload.get("messages"), dict) else {}
+        for message_id, item in messages.items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                ts = float(item.get("ts") or 0)
+            except (TypeError, ValueError):
+                continue
+            chat_id = str(item.get("chat_id") or "")
+            text = str(item.get("text") or "")
+            if ts < cutoff or not chat_id or not text:
+                continue
+            self._incoming_message_context[str(message_id)] = (ts, chat_id, text[:1000])
+
+    def _save_incoming_message_context(self) -> None:
+        path = self._incoming_context_state_path
+        if not path:
+            return
+        try:
+            self._prune_incoming_message_context()
+            payload = {
+                "version": 1,
+                "updated_at": time.time(),
+                "messages": {
+                    message_id: {
+                        "ts": ts,
+                        "chat_id": chat_id,
+                        "text": text,
+                    }
+                    for message_id, (ts, chat_id, text) in self._incoming_message_context.items()
+                },
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.debug("LINE: could not save incoming context state: %s", exc)
 
     def _prune_sent_message_ids(self) -> None:
         cutoff = time.time() - SENT_MESSAGE_ID_TTL_SECONDS

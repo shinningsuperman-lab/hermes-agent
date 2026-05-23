@@ -425,6 +425,10 @@ async def _get_updates(
         )
     except asyncio.TimeoutError:
         return {"ret": 0, "msgs": [], "get_updates_buf": sync_buf}
+    except RuntimeError as exc:
+        if "HTTP 524" in str(exc):
+            return {"ret": 0, "msgs": [], "get_updates_buf": sync_buf}
+        raise
 
 
 async def _send_message(

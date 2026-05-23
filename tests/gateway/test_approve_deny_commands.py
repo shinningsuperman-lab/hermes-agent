@@ -273,6 +273,98 @@ class TestApproveCommand:
         assert "expired" in result.lower() or "no longer waiting" in result.lower()
         assert session_key not in runner._pending_approvals
 
+    def test_compact_chinese_approval_prompt(self, monkeypatch):
+        """Compact prompts keep LINE approval requests short and localized."""
+        runner = _make_runner()
+        runner._read_user_config = lambda: {
+            "display": {
+                "language": "zh-hant",
+                "approval_prompt_style": "compact",
+                "approval_numeric_shortcuts": True,
+            }
+        }
+        monkeypatch.setenv("HERMES_LANGUAGE", "zh-hant")
+
+        result = runner._format_exec_approval_message(
+            _make_source(),
+            "printf 'x' >> /Users/vc/.openclaw/agents/main/workspace/memory/health.md",
+            "Security scan — [HIGH] Confusable Unicode characters in text",
+        )
+
+        assert "需要批准" in result
+        assert "文字安全檢查" in result
+        assert "追加寫入：memory/health.md" in result
+        assert "回覆 1 同意，2 拒絕" in result
+        assert "Dangerous command" not in result
+
+    @pytest.mark.asyncio
+    async def test_numeric_shortcut_approves_pending_command(self):
+        """When enabled, replying with 1 approves the oldest pending command."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        runner._read_user_config = lambda: {
+            "display": {"approval_numeric_shortcuts": True}
+        }
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_exec_approval_shortcut_if_pending(
+            _make_event("1"),
+            True,
+        )
+
+        assert "approved" in result.lower()
+        assert entry.event.is_set()
+        assert entry.result == "once"
+
+    @pytest.mark.asyncio
+    async def test_numeric_shortcut_can_be_disabled(self):
+        """Bare numbers remain normal chat text unless the shortcut is enabled."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        runner._read_user_config = lambda: {
+            "display": {"approval_numeric_shortcuts": False}
+        }
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_exec_approval_shortcut_if_pending(
+            _make_event("1"),
+            True,
+        )
+
+        assert result is None
+        assert not entry.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_approval_ack_can_be_disabled(self):
+        """Profiles can suppress the transient approval acknowledgement bubble."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        runner._read_user_config = lambda: {
+            "display": {"approval_ack_enabled": False}
+        }
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_approve_command(_make_event("/approve"))
+
+        assert result == ""
+        assert entry.event.is_set()
+        assert entry.result == "once"
+
 
 # ------------------------------------------------------------------
 # /deny command

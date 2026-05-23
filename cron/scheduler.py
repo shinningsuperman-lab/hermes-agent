@@ -14,6 +14,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -128,6 +129,23 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+
+_INTERNAL_CRON_FAILURE_MARKERS = (
+    "prompt matches threat pattern",
+    "Cron prompts must not contain injection",
+    "prompt contains invisible unicode",
+)
+
+
+def _should_deliver_failed_job_error(error: str | None) -> bool:
+    """Only user-actionable cron failures should be delivered to chat.
+
+    Scanner/internal policy failures are already logged and written to the
+    cron output artifact; sending them to messaging platforms looks like a
+    system traceback rather than a human assistant response.
+    """
+    clean = str(error or "")
+    return not any(marker in clean for marker in _INTERNAL_CRON_FAILURE_MARKERS)
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
@@ -486,6 +504,40 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+def _extract_delivery_media(content: str):
+    """Extract cron delivery attachments from model output.
+
+    Cron jobs run through ``_deliver_result`` instead of the normal inbound
+    gateway response pipeline, so they need their own attachment extraction.
+    Agents sometimes emit generated local images as Markdown
+    ``![alt](/path/to/image.png)`` rather than ``MEDIA:/path/to/image.png``;
+    convert those existing local paths into native attachments before sending
+    the text portion.
+    """
+    from gateway.platforms.base import BasePlatformAdapter
+
+    media_files, cleaned = BasePlatformAdapter.extract_media(content)
+    local_files, cleaned = BasePlatformAdapter.extract_local_files(cleaned)
+
+    if local_files:
+        media_files.extend((path, False) for path in local_files)
+        # extract_local_files removes the path inside Markdown image syntax,
+        # leaving an empty tag like ![Daisy](). Keep that out of chat.
+        cleaned = re.sub(r"!\[[^\]\n]*\]\(\s*\)", "", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    deduped = []
+    seen = set()
+    for media_path, is_voice in media_files:
+        key = (media_path, bool(is_voice))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((media_path, is_voice))
+
+    return deduped, cleaned
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -531,9 +583,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     else:
         delivery_content = content
 
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
-    from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+    # Extract attachments so files are forwarded natively, not as raw text.
+    media_files, cleaned_delivery_content = _extract_delivery_media(delivery_content)
 
     try:
         config = load_gateway_config()
@@ -1751,8 +1802,15 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                # output is already saved above). Internal scanner failures
+                # are also kept out of chat and left in logs/output artifacts.
+                if success:
+                    deliver_content = final_response
+                elif _should_deliver_failed_job_error(error):
+                    deliver_content = f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                else:
+                    logger.info("Job '%s': suppressing internal cron failure delivery", job["id"])
+                    deliver_content = ""
                 should_deliver = bool(deliver_content)
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)

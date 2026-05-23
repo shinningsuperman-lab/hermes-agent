@@ -206,6 +206,18 @@ class TestAllowlist:
         assert score < 3
         assert "low_signal" in reasons
 
+    def test_group_chime_score_allows_golf_schedule_change(self):
+        score, reasons = _group_chime_score("T長官 23號週六先取消了\n沒人，28號長庚再來 PK")
+        assert score >= 3
+        assert "golf_context" in reasons
+        assert "coordination" in reasons
+
+    def test_group_chime_score_allows_quoted_memory_command(self):
+        score, reasons = _group_chime_score("記起來喔", has_quote=True)
+        assert score >= 3
+        assert "assistant_task" in reasons
+        assert "quote" in reasons
+
     def test_leading_group_trigger_is_stripped(self):
         assert _strip_leading_group_trigger("@daisy：測試", ["@daisy"]) == "測試"
         assert _strip_leading_group_trigger("  黛西 查讓桿", ["黛西"]) == "查讓桿"
@@ -423,6 +435,8 @@ class TestSendRouting:
     def test_internal_notice_recognized(self):
         assert _is_internal_notice("💾 Self-improvement review: User profile updated")
         assert _is_internal_notice("Self-improvement review: Skill created")
+        assert _is_internal_notice("[CLI error: You've hit your limit - resets 6:20pm (Asia/Taipei)]")
+        assert _is_internal_notice("⚡ Interrupting current task (iteration 1/90).")
         assert not _is_internal_notice("hello")
 
     def test_send_uses_reply_when_token_present(self, adapter):
@@ -481,6 +495,12 @@ class TestSendRouting:
 
     def test_send_internal_notice_is_suppressed(self, adapter):
         result = asyncio.run(adapter.send("Uchat", "💾 Self-improvement review: User profile updated"))
+        assert result.success
+        adapter._client.reply.assert_not_called()
+        adapter._client.push.assert_not_called()
+
+    def test_send_provider_limit_notice_is_suppressed(self, adapter):
+        result = asyncio.run(adapter.send("Uchat", "[CLI error: You've hit your limit - resets 6:20pm (Asia/Taipei)]"))
         assert result.success
         adapter._client.reply.assert_not_called()
         adapter._client.push.assert_not_called()

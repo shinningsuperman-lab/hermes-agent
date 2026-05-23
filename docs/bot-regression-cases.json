@@ -1,0 +1,540 @@
+{
+  "version": 1,
+  "updated_at": "2026-05-23",
+  "timezone": "Asia/Taipei",
+  "modes": {
+    "offline": "Read local files/logs only; safe to run anytime.",
+    "live-safe": "Human sends safe prompts in the real chat; no explicit adult content and no destructive action.",
+    "live-observed": "Human sends prompts and captures screenshots/log evidence; use only in private or approved test groups.",
+    "manual-boundary": "Human chooses sensitive boundary prompts; do not store explicit content in this case file."
+  },
+  "cases": [
+    {
+      "id": "SYS-001",
+      "title": "System and progress notices never reach chat",
+      "bots": ["xiaowei", "daisy", "nikita", "bubu", "nixie"],
+      "priority": "P0",
+      "mode": "live-safe",
+      "setup": ["Use a private test chat when possible.", "Start from a normal conversational prompt."],
+      "steps": [
+        {"send": "幫我整理一下今天要注意的事，簡短就好。"},
+        {"send": "幫我記一下：測試系統訊息不要外露。"}
+      ],
+      "expected": [
+        "Reply is natural Traditional Chinese.",
+        "No text like Still working, iteration, Command approved, Dangerous command, Cron job failed, Self-improvement review, CLI error, hit your limit, reset time, exit code, traceback, or tool names.",
+        "If approval is needed, the visible prompt must be short Chinese instructions with numeric options only."
+      ],
+      "pass_criteria": [
+        "No system/runtime phrase appears in chat screenshot.",
+        "Audit system leak scan does not produce new evidence after the test timestamp."
+      ],
+      "evidence": ["chat screenshot", "scripts/bot_regression_audit.py output"]
+    },
+    {
+      "id": "FMT-001",
+      "title": "Market and earnings answer is scannable",
+      "bots": ["xiaowei", "daisy", "nikita", "bubu", "nixie"],
+      "priority": "P0",
+      "mode": "live-safe",
+      "steps": [
+        {"send": "NVDA 財報重點，短一點但要有判斷。"}
+      ],
+      "expected": [
+        "Starts with one-line conclusion.",
+        "Uses 3 to 5 short bullets or numbered points.",
+        "Uses emphasis for the key ticker/metric when the platform renders it cleanly.",
+        "Does not send one dense paragraph longer than one phone screen."
+      ],
+      "pass_criteria": [
+        "Readable on mobile without scrolling through a wall of text.",
+        "Contains a conclusion, key metrics, and risk/next watch item."
+      ],
+      "evidence": ["chat screenshot"]
+    },
+    {
+      "id": "FMT-002",
+      "title": "News and market freshness is explicit",
+      "bots": ["xiaowei", "daisy", "nikita", "bubu", "nixie"],
+      "priority": "P1",
+      "mode": "live-safe",
+      "steps": [
+        {"send": "美股今天盤前重點，用台北時間講。"}
+      ],
+      "expected": [
+        "Mentions the date/time basis when giving market-sensitive information.",
+        "Separates confirmed facts from interpretation.",
+        "If live data is unavailable, says so briefly and avoids pretending."
+      ],
+      "pass_criteria": [
+        "No stale or impossible date.",
+        "No fabricated source attribution."
+      ],
+      "evidence": ["chat screenshot"]
+    },
+    {
+      "id": "TIME-001",
+      "title": "US market reminder uses Taipei time",
+      "bots": ["xiaowei", "daisy", "nikita", "bubu", "nixie"],
+      "priority": "P0",
+      "mode": "live-safe",
+      "steps": [
+        {"send": "PANW 跟 CRWD 財報當天晚上美股開盤前 30 分鐘提醒我，用台北時間。"}
+      ],
+      "expected": [
+        "Interprets US market open as 21:30 Taipei time during US daylight saving time.",
+        "Schedules or proposes 21:00 Taipei time for pre-open reminders.",
+        "Shows exact local dates and avoids shifting to the wrong day."
+      ],
+      "pass_criteria": [
+        "Dates and times are correct in Asia/Taipei.",
+        "Bot does not say vague '當天晚上' without exact date/time."
+      ],
+      "evidence": ["chat screenshot", "scheduler/todo state if available"]
+    },
+    {
+      "id": "TIME-002",
+      "title": "Relative day scheduling is concrete",
+      "bots": ["xiaowei", "daisy", "nikita", "bubu", "nixie"],
+      "priority": "P1",
+      "mode": "live-safe",
+      "steps": [
+        {"send": "明天早上 8:30 提醒我帶健保卡。"}
+      ],
+      "expected": [
+        "Confirms the absolute date and 08:30 Taipei time.",
+        "Does not silently use UTC or a US timezone.",
+        "Does not create duplicate reminders if repeated once."
+      ],
+      "pass_criteria": [
+        "Confirmation includes exact date.",
+        "Duplicate repeat is handled as update/exists, not a second task."
+      ],
+      "evidence": ["chat screenshot", "scheduler/todo state if available"]
+    },
+    {
+      "id": "TODO-XW-001",
+      "title": "Xiaowei durable todo list is complete",
+      "bots": ["xiaowei"],
+      "priority": "P0",
+      "mode": "live-safe",
+      "steps": [
+        {"send": "待辦事項"},
+        {"send": "今日待辦呢？"}
+      ],
+      "expected": [
+        "Both prompts return the same durable todo source.",
+        "Current baseline should include 10 open items unless the user intentionally completed some.",
+        "Does not fall back to the old two-item builtin todo tool."
+      ],
+      "pass_criteria": [
+        "List count matches data/todos.json open items.",
+        "KH86 and HQ QH10 appear together with the older Lenovo CM items."
+      ],
+      "evidence": ["chat screenshot", "/Users/vc/.hermes/profiles/wechat/data/todos.json"]
+    },
+    {
+      "id": "TODO-XW-002",
+      "title": "Xiaowei todo add and duplicate behavior",
+      "bots": ["xiaowei"],
+      "priority": "P1",
+      "mode": "live-safe",
+      "steps": [
+        {"send": "待辦 測試不要重複新增"},
+        {"send": "待辦 測試不要重複新增"},
+        {"send": "待辦事項"}
+      ],
+      "expected": [
+        "First add creates one item.",
+        "Second add says it already exists or does not duplicate.",
+        "Todo list shows only one matching item."
+      ],
+      "pass_criteria": [
+        "No duplicate item in data/todos.json.",
+        "Reply is short and human-readable."
+      ],
+      "evidence": ["chat screenshot", "/Users/vc/.hermes/profiles/wechat/data/todos.json"]
+    },
+    {
+      "id": "CRON-XW-001",
+      "title": "Xiaowei morning image cron hides runtime status",
+      "bots": ["xiaowei"],
+      "priority": "P1",
+      "mode": "live-observed",
+      "setup": ["Observe the next 07:00 morning image job or trigger it in a private test flow."],
+      "steps": [
+        {"observe": "Inspect the morning image result."}
+      ],
+      "expected": [
+        "Only user-facing morning text and media appear.",
+        "No Cron job failed, Still working, running: image_generate, or blocked prompt warning appears."
+      ],
+      "pass_criteria": [
+        "Screenshot has no runtime status bubble.",
+        "If generation fails, the fallback is a natural short apology, not raw system output."
+      ],
+      "evidence": ["chat screenshot", "wechat agent.log around 07:00"]
+    },
+    {
+      "id": "IMG-DA-001",
+      "title": "Daisy reads quoted image context",
+      "bots": ["daisy"],
+      "priority": "P0",
+      "mode": "live-observed",
+      "setup": ["Send or quote a clear golf scorecard image in LINE."],
+      "steps": [
+        {"send": "回覆那張照片並問：@daisy 看一下這個成績。"}
+      ],
+      "expected": [
+        "Daisy discusses the image content directly.",
+        "Does not say she did not see the image when LINE context exists.",
+        "If image is unavailable, asks for one concise resend and logs enough context to debug."
+      ],
+      "pass_criteria": [
+        "No '沒看到/看不到/再丟一次' when context files contain the media.",
+        "line-incoming-context.json or line-sent-media-context.json records the relevant media."
+      ],
+      "evidence": ["chat screenshot", "Daisy line context files"]
+    },
+    {
+      "id": "IMG-DA-002",
+      "title": "Daisy stores and reuses a sticker/image reference",
+      "bots": ["daisy"],
+      "priority": "P1",
+      "mode": "live-observed",
+      "setup": ["Use a non-sensitive sticker/image."],
+      "steps": [
+        {"send": "把這張存起來，以後看到高爾夫太離譜就用。"},
+        {"send": "高爾夫這個太離譜了，丟那張。"}
+      ],
+      "expected": [
+        "Daisy confirms what she stored in plain Chinese.",
+        "Later prompt retrieves or reuses the intended asset.",
+        "Does not ask '這個它是哪個' when the quoted media is available."
+      ],
+      "pass_criteria": [
+        "Stored reference can be invoked by meaning, not only exact filename.",
+        "No raw file path unless needed for debugging."
+      ],
+      "evidence": ["chat screenshot", "Daisy memory/assets state if available"]
+    },
+    {
+      "id": "GRP-DA-001",
+      "title": "Daisy understands group messages without explicit mention",
+      "bots": ["daisy"],
+      "priority": "P0",
+      "mode": "live-observed",
+      "setup": ["Use an approved test group where Daisy is the only active bot."],
+      "steps": [
+        {"send": "有人取消 23 號，28 號再來 PK，記一下。"},
+        {"observe": "Daisy is not explicitly mentioned; decide whether she should respond or remember silently."}
+      ],
+      "expected": [
+        "If the message clearly asks for memory/action, Daisy records it or replies briefly.",
+        "If it is just group chatter, Daisy stays quiet.",
+        "No confused reply like '要記哪一件' when the quoted content is visible."
+      ],
+      "pass_criteria": [
+        "Correct trigger decision.",
+        "If replying, output is short and useful."
+      ],
+      "evidence": ["group screenshot", "Daisy session/log around test"]
+    },
+    {
+      "id": "GRP-DA-002",
+      "title": "Daisy handles quoted group context",
+      "bots": ["daisy"],
+      "priority": "P0",
+      "mode": "live-observed",
+      "setup": ["Quote a prior group message in LINE."],
+      "steps": [
+        {"send": "@daisy 記起來喔"}
+      ],
+      "expected": [
+        "Daisy extracts the quoted message, not only the new text.",
+        "Daisy confirms the remembered content succinctly.",
+        "No hallucinated '女朋友/老公' style joke in task memory mode."
+      ],
+      "pass_criteria": [
+        "Remembered content matches quoted message.",
+        "Tone stays practical in group/task mode."
+      ],
+      "evidence": ["group screenshot", "Daisy session/log around test"]
+    },
+    {
+      "id": "GRP-LINE-001",
+      "title": "LINE group trigger contract is installed",
+      "bots": ["daisy", "nikita", "bubu", "nixie"],
+      "priority": "P0",
+      "mode": "offline",
+      "steps": [
+        {"run": "python3 scripts/bot_regression_audit.py --bot daisy"},
+        {"run": "python3 scripts/bot_regression_audit.py --bot bubu"},
+        {"run": "python3 scripts/bot_regression_audit.py --bot nixie"}
+      ],
+      "expected": [
+        "Audit confirms mention, keyword, quote/media context, and chime-in primitives where supported.",
+        "Bots with no allowed group configured are reported as SKIP, not FAIL.",
+        "No bot is configured to reply to every group message unless explicitly intended."
+      ],
+      "pass_criteria": [
+        "Daisy, BUBU, and Nixie group-contract checks are OK.",
+        "Nikita is OK or SKIP depending on whether it has been added to a group."
+      ],
+      "evidence": ["audit output", "selftest output"]
+    },
+    {
+      "id": "GRP-BU-001",
+      "title": "BUBU group mention and task chime are conservative",
+      "bots": ["bubu"],
+      "priority": "P0",
+      "mode": "live-observed",
+      "setup": ["Use an approved LINE group where BUBU is allowed."],
+      "steps": [
+        {"send": "hi"},
+        {"send": "Use LINE native mention to ask BUBU: 看一下今天要注意什麼"},
+        {"send": "幫我記一下 28 號再 PK"}
+      ],
+      "expected": [
+        "BUBU stays quiet on low-signal 'hi'.",
+        "BUBU responds to LINE native @ mention even if the plain text does not contain '小布'.",
+        "BUBU may chime in on clear task/memory requests, but stays short and group-safe."
+      ],
+      "pass_criteria": [
+        "No private persona/system text appears.",
+        "No reply to generic low-signal chatter.",
+        "Task-like group request is handled or asks one concise clarification."
+      ],
+      "evidence": ["group screenshot", "BUBU bridge log"]
+    },
+    {
+      "id": "GRP-NX-001",
+      "title": "Nixie group routing handles social, schedule, and golf without overreplying",
+      "bots": ["nixie"],
+      "priority": "P0",
+      "mode": "live-observed",
+      "setup": ["Use an approved LINE group where Nixie is the only active Nixie-family bot."],
+      "steps": [
+        {"send": "Nixie 還好妳有提醒 😂"},
+        {"send": "T 長官 23 號週六先取消了，沒人，28 號長庚再來 PK"},
+        {"send": "收到"}
+      ],
+      "expected": [
+        "Social gratitude routes to a short social reply, not a golf parser wall.",
+        "Golf/schedule content is remembered or summarized when it is actionable.",
+        "Low-signal '收到' does not trigger a needless reply."
+      ],
+      "pass_criteria": [
+        "Route decision is correct in route-decisions.jsonl.",
+        "No dense numbering or improvement-plan text leaks.",
+        "No overreply to closed acknowledgements."
+      ],
+      "evidence": ["group screenshot", "Nixie route-decisions.jsonl"]
+    },
+    {
+      "id": "ADULT-DA-001",
+      "title": "Daisy auto-switches adult mode only when appropriate",
+      "bots": ["daisy"],
+      "priority": "P1",
+      "mode": "manual-boundary",
+      "setup": ["Use private Daisy chat.", "Use your own boundary prompt; do not paste explicit text into this case file."],
+      "steps": [
+        {"send": "普通撒嬌/安慰 prompt"},
+        {"send": "明確成人小說模式 prompt, chosen by the tester"}
+      ],
+      "expected": [
+        "Normal affection stays in normal mode.",
+        "Adult fiction intent routes to the configured local/adult router when available.",
+        "Daisy keeps replies shorter, natural, and does not expose router/system details."
+      ],
+      "pass_criteria": [
+        "Mode choice matches intent.",
+        "No generic safety lecture when the local adult route is supposed to handle the request.",
+        "No explicit test text is stored in repo files."
+      ],
+      "evidence": ["private chat screenshot", "Daisy logs showing router decision without raw explicit content"]
+    },
+    {
+      "id": "ADULT-DA-002",
+      "title": "Daisy adult route failure is graceful",
+      "bots": ["daisy"],
+      "priority": "P1",
+      "mode": "manual-boundary",
+      "steps": [
+        {"send": "Tester sends a boundary adult-mode request in private chat."}
+      ],
+      "expected": [
+        "If local model returns no content, Daisy says a short natural fallback.",
+        "No phrase like '本機成人創作模型沒有回傳內容'.",
+        "No Python/tool/router error appears."
+      ],
+      "pass_criteria": [
+        "Failure mode still feels human.",
+        "System details stay out of chat."
+      ],
+      "evidence": ["private chat screenshot", "Daisy gateway.log"]
+    },
+    {
+      "id": "NIKITA-001",
+      "title": "Nikita only runs on Hermes and hides runtime status",
+      "bots": ["nikita"],
+      "priority": "P0",
+      "mode": "offline",
+      "steps": [
+        {"run": "python3 scripts/bot_regression_audit.py --bot nikita"}
+      ],
+      "expected": [
+        "Hermes launchd service is running.",
+        "Local LINE health endpoint answers.",
+        "System/progress/approval notice suppression settings are present."
+      ],
+      "pass_criteria": [
+        "No old Nikita runtime is required for the live bot.",
+        "Audit does not report missing suppression config."
+      ],
+      "evidence": ["audit output"]
+    },
+    {
+      "id": "BUBU-001",
+      "title": "BUBU bridge is healthy and filters Hermes status output",
+      "bots": ["bubu"],
+      "priority": "P0",
+      "mode": "offline",
+      "steps": [
+        {"run": "python3 scripts/bot_regression_audit.py --bot bubu"}
+      ],
+      "expected": [
+        "BUBU bridge launchd service is running.",
+        "Local health endpoint answers.",
+        "Bridge filter removes provider timeout, retry, approval, self-improvement, command-status, and CLI limit lines before LINE delivery."
+      ],
+      "pass_criteria": [
+        "Health endpoint is OK.",
+        "Audit says system-status filter is OK."
+      ],
+      "evidence": ["audit output", "/tmp/openclaw/hermes-bubu-line-proxy*.log"]
+    },
+    {
+      "id": "NIXIE-001",
+      "title": "Nixie Lab runtime has Taipei morning-time fix",
+      "bots": ["nixie"],
+      "priority": "P0",
+      "mode": "offline",
+      "steps": [
+        {"run": "python3 scripts/bot_regression_audit.py --bot nixie"}
+      ],
+      "expected": [
+        "runtime morning-time fix is OK.",
+        "local health is OK.",
+        "No source/runtime drift for scheduling helpers."
+      ],
+      "pass_criteria": [
+        "No WARN on runtime morning-time fix.",
+        "Health endpoint answers on local port."
+      ],
+      "evidence": ["audit output"]
+    },
+    {
+      "id": "NIXIE-002",
+      "title": "Nixie reminder correction does not overcommit",
+      "bots": ["nixie"],
+      "priority": "P1",
+      "mode": "live-safe",
+      "steps": [
+        {"send": "21:30 沒有提醒耶"},
+        {"send": "剛剛那個不要自動亂記，先跟我確認。"}
+      ],
+      "expected": [
+        "Nixie acknowledges the missed reminder and proposes a fix.",
+        "Does not claim she will act at a time that has already passed.",
+        "Does not create unrelated memory or task without confirmation."
+      ],
+      "pass_criteria": [
+        "Reply is honest and concrete.",
+        "Scheduler state matches what was confirmed."
+      ],
+      "evidence": ["chat screenshot", "Nixie personal-organizer state"]
+    },
+    {
+      "id": "NIXIE-003",
+      "title": "Nixie output format matches Daisy/Xiaowei quality",
+      "bots": ["nixie"],
+      "priority": "P0",
+      "mode": "live-safe",
+      "steps": [
+        {"send": "NVDA 財報重點，像小薇那樣漂亮一點。"}
+      ],
+      "expected": [
+        "Uses short title, one-line conclusion, and bullets.",
+        "Avoids one long unbroken paragraph.",
+        "Avoids over-explaining and does not leak improvement-plan text."
+      ],
+      "pass_criteria": [
+        "Readable within one mobile screen.",
+        "Comparable structure to Xiaowei/Daisy baseline."
+      ],
+      "evidence": ["chat screenshot"]
+    },
+    {
+      "id": "MEM-001",
+      "title": "Memory recall is honest and source-aware",
+      "bots": ["xiaowei", "daisy", "nikita", "bubu", "nixie"],
+      "priority": "P1",
+      "mode": "live-safe",
+      "steps": [
+        {"send": "我最近看醫生的時間你記得嗎？"}
+      ],
+      "expected": [
+        "If memory exists, returns exact known appointments with dates.",
+        "If not found, says it cannot find it and asks one concise follow-up.",
+        "Does not invent appointments or doctors."
+      ],
+      "pass_criteria": [
+        "Known appointments match stored memory/scheduler.",
+        "Unknown case is transparent."
+      ],
+      "evidence": ["chat screenshot", "memory/scheduler state if available"]
+    },
+    {
+      "id": "LONG-001",
+      "title": "Long image generation does not show raw progress",
+      "bots": ["xiaowei", "daisy", "bubu", "nixie"],
+      "priority": "P1",
+      "mode": "live-safe",
+      "steps": [
+        {"send": "生一張早安圖，簡單就好。"}
+      ],
+      "expected": [
+        "While working, no raw iteration/running/tool status appears.",
+        "Final output contains short text and media.",
+        "If interrupted, the user-facing reply remains natural."
+      ],
+      "pass_criteria": [
+        "No runtime progress bubble in chat.",
+        "Generated media or graceful fallback appears."
+      ],
+      "evidence": ["chat screenshot", "gateway logs"]
+    },
+    {
+      "id": "FAIL-001",
+      "title": "Tool or permission failure stays user-friendly",
+      "bots": ["xiaowei", "daisy", "nikita", "bubu", "nixie"],
+      "priority": "P1",
+      "mode": "live-safe",
+      "steps": [
+        {"send": "幫我存一條記憶：測試權限失敗也不要露系統。"}
+      ],
+      "expected": [
+        "If approval is required, prompt is short and localized.",
+        "If approval succeeds, acknowledgement is hidden or human-readable.",
+        "If command is blocked or model quota is temporarily unavailable, bot explains what it can do next without raw scanner, provider, or reset-time text."
+      ],
+      "pass_criteria": [
+        "No raw security scanner output.",
+        "No raw provider limit output such as CLI error, hit your limit, or reset timestamp.",
+        "No English command dump unless explicitly requested."
+      ],
+      "evidence": ["chat screenshot", "audit system leak scan"]
+    }
+  ]
+}
