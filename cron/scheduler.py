@@ -560,13 +560,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
-    # Optionally wrap the content with a header/footer so the user knows this
-    # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
-    wrap_response = True
+    # Optionally wrap the content with a header/footer for debug/CLI profiles.
+    # Chat profiles should look like normal bot messages, so wrapping is off
+    # unless explicitly enabled via cron.wrap_response: true.
+    wrap_response = False
     try:
         user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        wrap_response = user_cfg.get("cron", {}).get("wrap_response", False)
     except Exception:
         pass
 
