@@ -488,6 +488,34 @@ async def test_line_group_chime_handles_golf_schedule_change(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_line_group_chime_handles_time_conflict_schedule_change(monkeypatch):
+    adapter = line_adapter.LineAdapter(SimpleNamespace(extra={}))
+    adapter.group_trigger_keywords = ["@daisy"]
+    adapter.group_reply_mode = "mention_keyword_or_chime"
+    adapter.group_chime_in_enabled = True
+    adapter.group_chime_in_cooldown_seconds = 0
+    adapter.group_chime_in_min_score = 3
+    captured = []
+
+    async def fake_handle_message(event):
+        captured.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+    text = "@冠軍 鄭 @air Vincent 閃亮超人 我 6/7 中午臨時插入同學會，不能打，sorry"
+    await adapter._handle_message_event(
+        {
+            "replyToken": "reply-token",
+            "source": {"type": "group", "groupId": "C-test", "userId": "U-test"},
+            "message": {"type": "text", "id": "line-text-1", "text": text},
+        }
+    )
+
+    assert len(captured) == 1
+    assert captured[0].text == text
+
+
+@pytest.mark.asyncio
 async def test_line_postback_ready_delivers_cached_media(monkeypatch, tmp_path):
     image_path = tmp_path / "xiao-si.png"
     image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")

@@ -212,6 +212,11 @@ class TestAllowlist:
         assert "golf_context" in reasons
         assert "coordination" in reasons
 
+    def test_group_chime_score_allows_time_conflict_schedule_change(self):
+        score, reasons = _group_chime_score("@冠軍 鄭 @air Vincent 閃亮超人 我 6/7 中午臨時插入同學會，不能打，sorry")
+        assert score >= 3
+        assert "coordination" in reasons
+
     def test_group_chime_score_allows_quoted_memory_command(self):
         score, reasons = _group_chime_score("記起來喔", has_quote=True)
         assert score >= 3
