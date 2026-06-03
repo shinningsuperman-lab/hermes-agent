@@ -35,6 +35,80 @@ logger = logging.getLogger(__name__)
 
 WEIXIN_COPY_LINE_WIDTH = 120
 
+_INTERNAL_NOTICE_RE = re.compile(
+    r"(?:"
+    r"Self-improvement review|"
+    r"No response from provider|non-streaming|Aborting call|Retrying in|"
+    r"Still working|Interrupting current task|iteration\s+\d+/\d+|running:\s*[\w.-]+|"
+    r"codex went silent|retiring app-server session|app-server session|"
+    r"Command approved|Dangerous command requires approval|requires approval|"
+    r"Cron job\b.*\bfailed|prompt matches threat pattern|deception_hide|"
+    r"CLI error|You've hit your limit|hit your limit|"
+    r"resets?\s+.*(?:Asia/Taipei|UTC|PST|PDT|EST|EDT)|"
+    r"exit code\s+\d+|provider=|base_url=|model=|API call failed|Connection error|Traceback|RuntimeError|HTTPError|"
+    r"Codex refresh token|refresh token was already consumed|hermes auth|hermes model|re-authenticate|"
+    r"['\"]?NoneType['\"]?\s+object\s+is\s+not\s+iterable|"
+    r"Cronjob Response|job_id|tool result|"
+    r"\bHermes CLI\b|\bcodex\b.*\btool\b|"
+    r"^\s*\{?\s*\"(?:name|arguments|action|schedule|prompt|deliver)\"\s*:"
+    r")",
+    re.IGNORECASE,
+)
+
+_LOCAL_PATH_NOTICE_RE = re.compile(
+    r"(?:"
+    r"(?:file://)?(?:/Users|/private|/tmp|/var|/Volumes)/[^\s)>]+|"
+    r"~/(?:Library|Desktop|Documents|Downloads|codex|\.hermes|\.openclaw)/[^\s)>]+"
+    r")"
+)
+
+_INTERNAL_DETAIL_NOTICE_RE = re.compile(
+    r"(?:"
+    r"我已經定位到要改的檔案|定位到要改的檔案|"
+    r"morning_image\.py|codex_line_proxy\.py|openai_line_bot\.py|"
+    r"runtime/scripts|Library/Application Support|LaunchAgents?|"
+    r"\.secrets\b|\.plist\b|\.py\b|"
+    r"workspace/|memory/improvement-plans/|"
+    r"async job:|/nixie improvement|"
+    r"How to set .* in Hermes|built-in cronjob tool|"
+    r"Run the following command in a terminal"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_user_visible_content(content: str) -> str:
+    kept: List[str] = []
+    suppressed = 0
+    for raw_line in str(content or "").splitlines():
+        line = raw_line.strip()
+        if line and (
+            _INTERNAL_NOTICE_RE.search(line)
+            or _LOCAL_PATH_NOTICE_RE.search(line)
+            or _INTERNAL_DETAIL_NOTICE_RE.search(line)
+        ):
+            suppressed += 1
+            continue
+        kept.append(raw_line)
+    clean = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    if suppressed and not re.sub(r"[\s{}\[\],:;\"']+", "", clean):
+        return ""
+    return clean
+
+
+def _is_internal_notice(content: str) -> bool:
+    """Internal maintenance messages should stay in logs, not WeChat chats."""
+    if not content:
+        return False
+    stripped = content.strip()
+    return (
+        stripped.startswith("💾")
+        or stripped.startswith("Self-improvement review:")
+        or "Self-improvement review:" in stripped
+        or bool(_INTERNAL_NOTICE_RE.search(stripped))
+        or _sanitize_user_visible_content(stripped) == ""
+    )
+
 try:
     import aiohttp
 
@@ -1214,6 +1288,13 @@ class WeixinAdapter(BasePlatformAdapter):
             extra.get("send_chunk_retry_delay_seconds")
             or os.getenv("WEIXIN_SEND_CHUNK_RETRY_DELAY_SECONDS", "1.0")
         )
+        self._rate_limit_retry_delay_seconds = float(
+            extra.get("rate_limit_retry_delay_seconds")
+            or os.getenv(
+                "WEIXIN_RATE_LIMIT_RETRY_DELAY_SECONDS",
+                str(self._send_chunk_retry_delay_seconds * 3),
+            )
+        )
         self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "open")).strip().lower()
         self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
@@ -1636,9 +1717,21 @@ class WeixinAdapter(BasePlatformAdapter):
                             last_error = RuntimeError(
                                 f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
                             )
+                            if context_token and not retried_without_token:
+                                retried_without_token = True
+                                context_token = None
+                                self._token_store._cache.pop(
+                                    self._token_store._key(self._account_id, chat_id), None
+                                )
+                                self._token_store._persist(self._account_id)
+                                logger.warning(
+                                    "[%s] rate limited for %s; retrying without context_token",
+                                    self.name, _safe_id(chat_id),
+                                )
+                                continue
                             if attempt >= self._send_chunk_retries:
                                 break
-                            wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
+                            wait = self._rate_limit_retry_delay_seconds
                             logger.warning(
                                 "[%s] rate limited for %s; backing off %.1fs before retry",
                                 self.name, _safe_id(chat_id), wait,
@@ -1676,6 +1769,14 @@ class WeixinAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        content = _sanitize_user_visible_content(content)
+        if not content:
+            logger.info("[%s] suppressed empty/internal content for %s", self.name, _safe_id(chat_id))
+            return SendResult(success=True, message_id=None)
+        if _is_internal_notice(content):
+            logger.info("[%s] suppressed internal notice for %s", self.name, _safe_id(chat_id))
+            return SendResult(success=True, message_id=None)
+
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
         context_token = self._token_store.get(self._account_id, chat_id)
@@ -2085,6 +2186,10 @@ async def send_weixin_direct(
 
     This bypasses the long-poll adapter lifecycle and uses the raw API directly.
     """
+    if _is_internal_notice(message):
+        logger.info("Weixin direct send suppressed internal notice for %s", _safe_id(chat_id))
+        return {"success": True, "platform": "weixin", "chat_id": chat_id, "message_id": None}
+
     account_id = str(extra.get("account_id") or os.getenv("WEIXIN_ACCOUNT_ID", "")).strip()
     base_url = str(extra.get("base_url") or os.getenv("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
     cdn_base_url = str(extra.get("cdn_base_url") or os.getenv("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)).strip().rstrip("/")

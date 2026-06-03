@@ -134,6 +134,10 @@ _INTERNAL_CRON_FAILURE_MARKERS = (
     "prompt matches threat pattern",
     "Cron prompts must not contain injection",
     "prompt contains invisible unicode",
+    "Codex refresh token",
+    "refresh token was already consumed",
+    "hermes auth",
+    "hermes model",
 )
 
 
@@ -652,12 +656,24 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         adapter_ok = False
                     else:
                         try:
-                            send_result = future.result(timeout=60)
+                            retries = int(getattr(runtime_adapter, "_send_chunk_retries", 4) or 4)
+                            rate_wait = float(getattr(runtime_adapter, "_rate_limit_retry_delay_seconds", 3.0) or 3.0)
+                            send_timeout = max(60.0, (retries + 1) * rate_wait + 30.0)
+                            send_result = future.result(timeout=send_timeout)
                         except TimeoutError:
                             future.cancel()
                             raise
                         if send_result and not getattr(send_result, "success", True):
                             err = getattr(send_result, "error", "unknown")
+                            if "rate limited" in str(err).lower():
+                                logger.warning(
+                                    "Job '%s': live adapter send to %s:%s hit rate limit (%s); "
+                                    "skipping standalone fallback",
+                                    job["id"], platform_name, chat_id, err,
+                                )
+                                delivery_errors.append(f"delivery error: {platform_name} rate limited: {err}")
+                                delivered = True
+                                continue
                             logger.warning(
                                 "Job '%s': live adapter send to %s:%s failed (%s), falling back to standalone",
                                 job["id"], platform_name, chat_id, err,

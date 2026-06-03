@@ -81,6 +81,39 @@ class TestWeixinFormatting:
 
         assert adapter.format_message(None) == ""
 
+    def test_internal_notice_recognized(self):
+        assert weixin._is_internal_notice("⚠️ Cron job '每日早安圖' failed:\nRuntimeError: 'NoneType' object is not iterable")
+        assert weixin._is_internal_notice("[CLI error: You've hit your limit - resets 6:20pm (Asia/Taipei)]")
+        assert weixin._is_internal_notice("⚠️ codex went silent for 90s after a tool result; retiring app-server session.")
+        assert weixin._is_internal_notice(
+            "RuntimeError: Codex refresh token was already consumed by another client. "
+            "Run codex in your terminal, then run hermes auth to re-authenticate."
+        )
+        assert weixin._is_internal_notice(
+            "{\n"
+            '  "name": "cronjob",\n'
+            '  "arguments": {\n'
+            '    "action": "create",\n'
+            '    "schedule": "2026-06-01T20:00"\n'
+            "  }\n"
+            "}"
+        )
+        assert not weixin._is_internal_notice("早安，閃亮超人。")
+
+    def test_sanitize_user_visible_content_removes_local_paths(self):
+        content = (
+            "可以，方向我會調成亮色、夏季感、多變穿搭。\n"
+            "我已經定位到要改的檔案：\n"
+            "- [Nixie Lab morning_image.py](</Users/vc/Library/Application Support/nixie-lab-agent/runtime/scripts/morning_image.py:140>)\n"
+            "- BUBU morning_image.py\n"
+            "每天輪換不同搭配。"
+        )
+
+        assert weixin._sanitize_user_visible_content(content) == (
+            "可以，方向我會調成亮色、夏季感、多變穿搭。\n"
+            "每天輪換不同搭配。"
+        )
+
 
 class TestWeixinChunking:
     def test_split_text_splits_short_chatty_replies_into_separate_bubbles(self):

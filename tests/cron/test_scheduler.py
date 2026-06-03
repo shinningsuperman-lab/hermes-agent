@@ -1822,6 +1822,21 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         mark_mock.assert_called_once()
 
+    def test_codex_auth_failure_does_not_deliver_to_chat(self):
+        error = (
+            "RuntimeError: Codex refresh token was already consumed by another client. "
+            "Run codex in your terminal, then run hermes auth to re-authenticate."
+        )
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(False, "# output", "", error)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_not_called()
+        mark_mock.assert_called_once()
+
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \

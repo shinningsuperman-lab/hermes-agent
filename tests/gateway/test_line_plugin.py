@@ -43,6 +43,7 @@ _message_mentions_self = _line._message_mentions_self
 _parse_sent_messages_body = _line._parse_sent_messages_body
 _strip_leading_group_trigger = _line._strip_leading_group_trigger
 _is_internal_notice = _line._is_internal_notice
+_sanitize_user_visible_content = _line._sanitize_user_visible_content
 _is_system_bypass = _line._is_system_bypass
 RequestCache = _line.RequestCache
 State = _line.State
@@ -442,7 +443,36 @@ class TestSendRouting:
         assert _is_internal_notice("Self-improvement review: Skill created")
         assert _is_internal_notice("[CLI error: You've hit your limit - resets 6:20pm (Asia/Taipei)]")
         assert _is_internal_notice("⚡ Interrupting current task (iteration 1/90).")
+        assert _is_internal_notice("⚠️ 'NoneType' object is not iterable")
+        assert _is_internal_notice("⚠️ codex went silent for 90s after a tool result; retiring app-server session.")
+        assert _is_internal_notice(
+            "RuntimeError: Codex refresh token was already consumed by another client. "
+            "Run codex in your terminal, then run hermes auth to re-authenticate."
+        )
+        assert _is_internal_notice(
+            "{\n"
+            '  "name": "cronjob",\n'
+            '  "arguments": {\n'
+            '    "action": "create",\n'
+            '    "schedule": "2026-06-01T20:00"\n'
+            "  }\n"
+            "}"
+        )
         assert not _is_internal_notice("hello")
+
+    def test_sanitize_user_visible_content_removes_local_paths(self):
+        content = (
+            "可以，方向我會調成亮色、夏季感、多變穿搭。\n"
+            "我已經定位到要改的檔案：\n"
+            "- [Nixie Lab morning_image.py](</Users/vc/Library/Application Support/nixie-lab-agent/runtime/scripts/morning_image.py:140>)\n"
+            "- BUBU morning_image.py\n"
+            "每天輪換不同搭配。"
+        )
+
+        assert _sanitize_user_visible_content(content) == (
+            "可以，方向我會調成亮色、夏季感、多變穿搭。\n"
+            "每天輪換不同搭配。"
+        )
 
     def test_send_uses_reply_when_token_present(self, adapter):
         import time as _time
@@ -509,6 +539,20 @@ class TestSendRouting:
         assert result.success
         adapter._client.reply.assert_not_called()
         adapter._client.push.assert_not_called()
+
+    def test_send_local_path_notice_keeps_visible_lines_only(self, adapter):
+        result = asyncio.run(
+            adapter.send(
+                "Uchat",
+                "可以，方向我會調成亮色、夏季感。\n"
+                "- [Nixie Lab morning_image.py](</Users/vc/Library/Application Support/nixie-lab-agent/runtime/scripts/morning_image.py:140>)\n"
+                "每天輪換不同搭配。",
+            )
+        )
+        assert result.success
+        adapter._client.push.assert_called_once()
+        sent_messages = adapter._client.push.call_args.args[1]
+        assert sent_messages[0]["text"] == "可以，方向我會調成亮色、夏季感。\n每天輪換不同搭配。"
 
     def test_send_caps_messages_per_call_at_five(self, adapter):
         # Build a payload that would naturally split into more than 5 LINE
@@ -790,6 +834,18 @@ class TestAdapterInit:
         assert ad.group_chime_in_enabled is True
         assert ad.group_chime_in_cooldown_seconds == 60
 
+    def test_env_group_review_parsed(self, monkeypatch):
+        monkeypatch.setenv("LINE_CHANNEL_ACCESS_TOKEN", "t")
+        monkeypatch.setenv("LINE_CHANNEL_SECRET", "s")
+        monkeypatch.setenv("LINE_GROUP_REVIEW_ENABLED", "true")
+        monkeypatch.setenv("LINE_GROUP_REVIEW_GROUPS", "C1,C2")
+        monkeypatch.setenv("LINE_GROUP_REVIEW_OWNER_USER_ID", "Uowner")
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(PlatformConfig(enabled=True))
+        assert ad.group_review_enabled is True
+        assert ad.group_review_groups == {"C1", "C2"}
+        assert ad.group_review_owner_user_id == "Uowner"
+
     def test_parse_sent_message_response_body(self):
         body = json.dumps({"sentMessages": [{"id": "m1", "quoteToken": "q1"}]})
         assert _parse_sent_messages_body(body) == [{"id": "m1", "quoteToken": "q1"}]
@@ -803,3 +859,213 @@ class TestAdapterInit:
         assert asyncio.run(ad.get_chat_info("U123"))["type"] == "dm"
         assert asyncio.run(ad.get_chat_info("C123"))["type"] == "group"
         assert asyncio.run(ad.get_chat_info("R123"))["type"] == "channel"
+
+
+class TestGroupReview:
+
+    @pytest.fixture
+    def adapter(self, tmp_path, monkeypatch):
+        for key in (
+            "LINE_CHANNEL_ACCESS_TOKEN",
+            "LINE_CHANNEL_SECRET",
+            "LINE_GROUP_REVIEW_ENABLED",
+            "LINE_GROUP_REVIEW_GROUPS",
+            "LINE_GROUP_REVIEW_OWNER_USER_ID",
+            "LINE_HOME_CHANNEL",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        from gateway.config import PlatformConfig
+        ad = LineAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "channel_access_token": "tok",
+                    "channel_secret": "sec",
+                    "group_review_enabled": True,
+                    "group_review_groups": ["Cgroup"],
+                    "group_review_owner_user_id": "Uowner",
+                },
+            )
+        )
+        ad._client = MagicMock()
+        ad._client.push = AsyncMock()
+        ad._group_review_state_path = tmp_path / "line-group-review-state.json"
+        ad._group_review_log_path = tmp_path / "line-group-review-decisions.jsonl"
+        ad._group_review_memory_path = tmp_path / "memory" / "group_review_training.md"
+        return ad
+
+    def test_group_message_notifies_owner_and_creates_pending_review(self, adapter):
+        asyncio.run(
+            adapter._maybe_notify_group_review(
+                chat_id="Cgroup",
+                user_id="Uother",
+                message_id="m1",
+                message_type="text",
+                text="明天 6:45 長庚集合",
+            )
+        )
+
+        assert "1" in adapter._group_review_pending
+        adapter._client.push.assert_called_once()
+        assert adapter._client.push.call_args.args[0] == "Uowner"
+        sent_text = adapter._client.push.call_args.args[1][0]["text"]
+        assert "D1" in sent_text
+        assert "明天 6:45 長庚集合" in sent_text
+        assert "Daisy 原本預備回答" in sent_text
+        assert "1 不回" in sent_text
+        assert "2 <學到的規則>" in sent_text
+        assert "3 <要發到群裡的話>" in sent_text
+        assert "4 用 Daisy 原本預備回答" in sent_text
+        assert adapter._group_review_state_path.exists()
+
+    def test_owner_reply_sends_to_group_and_records_training(self, adapter):
+        adapter._group_review_pending["1"] = {
+            "review_id": "1",
+            "ts": 1779990000.0,
+            "chat_id": "Cgroup",
+            "sender_user_id": "Uother",
+            "message_id": "m1",
+            "message_type": "text",
+            "text": "明天 6:45 長庚集合",
+        }
+
+        handled = asyncio.run(
+            adapter._handle_group_review_owner_command(
+                "Uowner",
+                "Uowner",
+                "D1 回 收到，明天 6:45 長庚集合，7:00 tee off。",
+            )
+        )
+
+        assert handled is True
+        calls = adapter._client.push.call_args_list
+        assert calls[0].args[0] == "Cgroup"
+        assert "7:00 tee off" in calls[0].args[1][0]["text"]
+        assert calls[1].args[0] == "Uowner"
+        assert "1" not in adapter._group_review_pending
+        assert adapter._group_review_log_path.exists()
+        assert adapter._group_review_memory_path.exists()
+
+    def test_bare_review_id_marks_skip_and_never_reaches_agent(self, adapter):
+        adapter._group_review_pending["1"] = {
+            "review_id": "1",
+            "ts": 1779990000.0,
+            "chat_id": "Cgroup",
+            "sender_user_id": "Uother",
+            "message_id": "m1",
+            "message_type": "text",
+            "text": "對的，老爺 7:20 開球",
+        }
+
+        handled = asyncio.run(
+            adapter._handle_group_review_owner_command("Uowner", "Uowner", "D1")
+        )
+
+        assert handled is True
+        adapter._client.push.assert_called_once()
+        assert adapter._client.push.call_args.args[0] == "Uowner"
+        assert "已標記不回" in adapter._client.push.call_args.args[1][0]["text"]
+        assert "1" not in adapter._group_review_pending
+        assert adapter._group_review_log_path.exists()
+        assert '"action": "skip"' in adapter._group_review_log_path.read_text(encoding="utf-8")
+
+    def test_numbered_option_uses_latest_pending_review(self, adapter):
+        adapter._group_review_pending["7"] = {
+            "review_id": "7",
+            "ts": 1779990000.0,
+            "chat_id": "Cgroup",
+            "sender_user_id": "Uother",
+            "message_id": "m7",
+            "message_type": "text",
+            "text": "舊訊息",
+        }
+        adapter._group_review_pending["8"] = {
+            "review_id": "8",
+            "ts": 1779990100.0,
+            "chat_id": "Cgroup",
+            "sender_user_id": "Uother",
+            "message_id": "m8",
+            "message_type": "text",
+            "text": "新的球局更新",
+        }
+
+        handled = asyncio.run(
+            adapter._handle_group_review_owner_command("Uowner", "Uowner", "3 收到，已更新。")
+        )
+
+        assert handled is True
+        calls = adapter._client.push.call_args_list
+        assert calls[0].args[0] == "Cgroup"
+        assert calls[0].args[1][0]["text"] == "收到，已更新。"
+        assert calls[1].args[0] == "Uowner"
+        assert "7" in adapter._group_review_pending
+        assert "8" not in adapter._group_review_pending
+
+    def test_option_four_without_draft_marks_skip(self, adapter):
+        adapter._group_review_pending["1"] = {
+            "review_id": "1",
+            "ts": 1779990000.0,
+            "chat_id": "Cgroup",
+            "sender_user_id": "Uother",
+            "message_id": "m1",
+            "message_type": "text",
+            "text": "對的，老爺 7:20 開球",
+            "draft_reply": "",
+        }
+
+        handled = asyncio.run(
+            adapter._handle_group_review_owner_command("Uowner", "Uowner", "4")
+        )
+
+        assert handled is True
+        adapter._client.push.assert_called_once()
+        assert adapter._client.push.call_args.args[0] == "Uowner"
+        assert "沒有預備回答" in adapter._client.push.call_args.args[1][0]["text"]
+        assert "1" not in adapter._group_review_pending
+
+    def test_group_agent_response_is_captured_as_draft_for_review(self, adapter):
+        adapter._group_review_pending["1"] = {
+            "review_id": "1",
+            "ts": 1779990000.0,
+            "chat_id": "Cgroup",
+            "sender_user_id": "Uother",
+            "message_id": "m1",
+            "message_type": "text",
+            "text": "對的，老爺 7:20 開球",
+            "draft_reply": "",
+        }
+
+        result = asyncio.run(adapter.send("Cgroup", "收到，老爺 7:20 開球，我記起來。"))
+
+        assert result.success is True
+        assert result.message_id == "group-review-draft-1"
+        adapter._client.push.assert_called_once()
+        assert adapter._client.push.call_args.args[0] == "Uowner"
+        notice = adapter._client.push.call_args.args[1][0]["text"]
+        assert "Daisy 原本預備回答" in notice
+        assert "收到，老爺 7:20 開球，我記起來。" in notice
+        assert adapter._group_review_pending["1"]["draft_reply"] == "收到，老爺 7:20 開球，我記起來。"
+
+    def test_option_four_sends_captured_draft_to_group(self, adapter):
+        adapter._group_review_pending["1"] = {
+            "review_id": "1",
+            "ts": 1779990000.0,
+            "chat_id": "Cgroup",
+            "sender_user_id": "Uother",
+            "message_id": "m1",
+            "message_type": "text",
+            "text": "對的，老爺 7:20 開球",
+            "draft_reply": "收到，老爺 7:20 開球，我記起來。",
+        }
+
+        handled = asyncio.run(
+            adapter._handle_group_review_owner_command("Uowner", "Uowner", "4")
+        )
+
+        assert handled is True
+        calls = adapter._client.push.call_args_list
+        assert calls[0].args[0] == "Cgroup"
+        assert calls[0].args[1][0]["text"] == "收到，老爺 7:20 開球，我記起來。"
+        assert calls[1].args[0] == "Uowner"
+        assert "已用 Daisy 預備回答" in calls[1].args[1][0]["text"]
+        assert "1" not in adapter._group_review_pending

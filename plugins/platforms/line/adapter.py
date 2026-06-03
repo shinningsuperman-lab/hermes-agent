@@ -143,6 +143,8 @@ SENT_MESSAGE_ID_TTL_SECONDS = 86400  # lets quoted replies address the bot for 1
 SENT_MEDIA_STATE_FILENAME = "line-sent-media-context.json"
 INCOMING_CONTEXT_STATE_FILENAME = "line-incoming-context.json"
 POSTBACK_CACHE_STATE_FILENAME = "line-postback-cache.json"
+GROUP_REVIEW_STATE_FILENAME = "line-group-review-state.json"
+GROUP_REVIEW_LOG_FILENAME = "line-group-review-decisions.jsonl"
 LINE_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 LINE_AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
 LINE_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
@@ -1127,6 +1129,39 @@ def _line_postback_cache_path() -> Optional[Path]:
     return Path(raw_home) / POSTBACK_CACHE_STATE_FILENAME
 
 
+def _line_group_review_state_path() -> Optional[Path]:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()) / GROUP_REVIEW_STATE_FILENAME
+    except Exception:
+        raw_home = os.getenv("HERMES_HOME", "").strip()
+        if not raw_home:
+            return None
+    return Path(raw_home) / GROUP_REVIEW_STATE_FILENAME
+
+
+def _line_group_review_log_path() -> Optional[Path]:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()) / GROUP_REVIEW_LOG_FILENAME
+    except Exception:
+        raw_home = os.getenv("HERMES_HOME", "").strip()
+        if not raw_home:
+            return None
+    return Path(raw_home) / GROUP_REVIEW_LOG_FILENAME
+
+
+def _line_group_review_memory_path() -> Optional[Path]:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()) / "memory" / "group_review_training.md"
+    except Exception:
+        raw_home = os.getenv("HERMES_HOME", "").strip()
+        if not raw_home:
+            return None
+    return Path(raw_home) / "memory" / "group_review_training.md"
+
+
 def _line_media_cache_dir() -> Path:
     try:
         from hermes_constants import get_hermes_home
@@ -1349,14 +1384,60 @@ _INTERNAL_NOTICE_RE = re.compile(
     r"Self-improvement review|"
     r"No response from provider|non-streaming|Aborting call|Retrying in|"
     r"Still working|Interrupting current task|iteration\s+\d+/\d+|running:\s*[\w.-]+|"
+    r"codex went silent|retiring app-server session|app-server session|"
     r"Command approved|Dangerous command requires approval|requires approval|"
     r"Cron job\b.*\bfailed|prompt matches threat pattern|deception_hide|"
     r"CLI error|You've hit your limit|hit your limit|"
     r"resets?\s+.*(?:Asia/Taipei|UTC|PST|PDT|EST|EDT)|"
-    r"exit code\s+\d+|provider=|base_url=|model=|API call failed|Connection error|Traceback|HTTPError"
+    r"exit code\s+\d+|provider=|base_url=|model=|API call failed|Connection error|Traceback|RuntimeError|HTTPError|"
+    r"Codex refresh token|refresh token was already consumed|hermes auth|hermes model|re-authenticate|"
+    r"['\"]?NoneType['\"]?\s+object\s+is\s+not\s+iterable|"
+    r"Cronjob Response|job_id|tool result|"
+    r"\bHermes CLI\b|\bcodex\b.*\btool\b|"
+    r"^\s*\{?\s*\"(?:name|arguments|action|schedule|prompt|deliver)\"\s*:"
     r")",
     re.IGNORECASE,
 )
+
+_LOCAL_PATH_NOTICE_RE = re.compile(
+    r"(?:"
+    r"(?:file://)?(?:/Users|/private|/tmp|/var|/Volumes)/[^\s)>]+|"
+    r"~/(?:Library|Desktop|Documents|Downloads|codex|\.hermes|\.openclaw)/[^\s)>]+"
+    r")"
+)
+
+_INTERNAL_DETAIL_NOTICE_RE = re.compile(
+    r"(?:"
+    r"我已經定位到要改的檔案|定位到要改的檔案|"
+    r"morning_image\.py|codex_line_proxy\.py|openai_line_bot\.py|"
+    r"runtime/scripts|Library/Application Support|LaunchAgents?|"
+    r"\.secrets\b|\.plist\b|\.py\b|"
+    r"workspace/|memory/improvement-plans/|"
+    r"async job:|/nixie improvement|"
+    r"How to set .* in Hermes|built-in cronjob tool|"
+    r"Run the following command in a terminal"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_user_visible_content(content: str) -> str:
+    kept: List[str] = []
+    suppressed = 0
+    for raw_line in str(content or "").splitlines():
+        line = raw_line.strip()
+        if line and (
+            _INTERNAL_NOTICE_RE.search(line)
+            or _LOCAL_PATH_NOTICE_RE.search(line)
+            or _INTERNAL_DETAIL_NOTICE_RE.search(line)
+        ):
+            suppressed += 1
+            continue
+        kept.append(raw_line)
+    clean = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    if suppressed and not re.sub(r"[\s{}\[\],:;\"']+", "", clean):
+        return ""
+    return clean
 
 
 def _is_internal_notice(content: str) -> bool:
@@ -1369,6 +1450,7 @@ def _is_internal_notice(content: str) -> bool:
         or stripped.startswith("Self-improvement review:")
         or "Self-improvement review:" in stripped
         or bool(_INTERNAL_NOTICE_RE.search(stripped))
+        or _sanitize_user_visible_content(stripped) == ""
     )
 
 
@@ -1553,6 +1635,25 @@ class LineAdapter(BasePlatformAdapter):
         self.group_chime_in_allowed_groups = _csv_set(
             os.getenv("LINE_GROUP_CHIME_IN_ALLOWED_GROUPS", "")
         ) | set(extra.get("group_chime_in_allowed_groups", []))
+        self.group_review_enabled = _truthy_env(
+            "LINE_GROUP_REVIEW_ENABLED",
+            bool(extra.get("group_review_enabled", False)),
+        )
+        self.group_review_groups = _csv_set(
+            os.getenv("LINE_GROUP_REVIEW_GROUPS", "")
+        ) | set(extra.get("group_review_groups", []))
+        self.group_review_owner_user_id = (
+            os.getenv("LINE_GROUP_REVIEW_OWNER_USER_ID")
+            or str(extra.get("group_review_owner_user_id") or "").strip()
+            or os.getenv("LINE_HOME_CHANNEL")
+            or str(extra.get("home_channel") or "").strip()
+        )
+        self.group_review_max_pending = _int_env_or_extra(
+            "LINE_GROUP_REVIEW_MAX_PENDING",
+            extra,
+            "group_review_max_pending",
+            50,
+        )
 
         # Slow-LLM postback button threshold
         try:
@@ -1607,6 +1708,11 @@ class LineAdapter(BasePlatformAdapter):
         self._group_chime_state: Dict[str, Dict[str, Any]] = {}
         self._group_recent_message_times: Dict[str, List[float]] = {}
         self._group_last_reply_at: Dict[str, float] = {}
+        self._group_review_pending: Dict[str, Dict[str, Any]] = {}
+        self._group_review_next_id = 1
+        self._group_review_state_path: Optional[Path] = None
+        self._group_review_log_path: Optional[Path] = None
+        self._group_review_memory_path: Optional[Path] = None
 
         # Pending-button slot per chat — ensures one outstanding postback
         # button per chat at a time. Postback cache request_id keyed by chat_id.
@@ -1645,8 +1751,12 @@ class LineAdapter(BasePlatformAdapter):
         self._cache = RequestCache(state_path=_line_postback_cache_path())
         self._sent_media_state_path = _line_sent_media_state_path()
         self._incoming_context_state_path = _line_incoming_context_state_path()
+        self._group_review_state_path = _line_group_review_state_path()
+        self._group_review_log_path = _line_group_review_log_path()
+        self._group_review_memory_path = _line_group_review_memory_path()
         self._load_sent_media_state()
         self._load_incoming_message_context()
+        self._load_group_review_state()
 
         # Best-effort: fetch our own bot userId for self-message filtering.
         # If the call fails (offline tests, transient 5xx) we fall back to
@@ -1738,6 +1848,10 @@ class LineAdapter(BasePlatformAdapter):
         self._group_chime_state.clear()
         self._group_recent_message_times.clear()
         self._group_last_reply_at.clear()
+        self._group_review_pending.clear()
+        self._group_review_state_path = None
+        self._group_review_log_path = None
+        self._group_review_memory_path = None
 
         if self._lock_key:
             try:
@@ -1835,6 +1949,7 @@ class LineAdapter(BasePlatformAdapter):
 
         group_gate_enabled = self.group_reply_mode != "always"
         if chat_type == "group" and group_gate_enabled and msg_type != "text":
+            review_text = f"[{msg_type}]"
             if msg_type == "image" and self.group_media_context_ttl > 0:
                 filename = msg.get("fileName", "") or ""
                 local_path = await self._download_media(
@@ -1847,10 +1962,18 @@ class LineAdapter(BasePlatformAdapter):
                     media_type = _line_media_type(msg_type, filename or local_path)
                     self._remember_group_media(chat_id, user_id, local_path, media_type)
                     logger.info("LINE: cached group %s context from %s", msg_type, chat_id)
+                    review_text = "[image]"
                 else:
                     logger.info("LINE: ignoring group %s message without text trigger from %s", msg_type, chat_id)
             else:
                 logger.info("LINE: ignoring group %s message without text trigger from %s", msg_type, chat_id)
+            await self._maybe_notify_group_review(
+                chat_id=chat_id,
+                user_id=user_id,
+                message_id=message_id,
+                message_type=msg_type,
+                text=review_text,
+            )
             return
 
         # Stash the reply token for outbound use.
@@ -1886,6 +2009,19 @@ class LineAdapter(BasePlatformAdapter):
             text = f"[location: {title} {address}]".strip()
         else:
             text = f"[unsupported message type: {msg_type}]"
+
+        if chat_type == "dm" and msg_type == "text":
+            if await self._handle_group_review_owner_command(chat_id, user_id, text):
+                return
+
+        if chat_type == "group":
+            await self._maybe_notify_group_review(
+                chat_id=chat_id,
+                user_id=user_id,
+                message_id=message_id,
+                message_type=msg_type,
+                text=text,
+            )
 
         if msg_type == "text":
             self._remember_incoming_message_context(message_id, chat_id, text)
@@ -2711,6 +2847,303 @@ class LineAdapter(BasePlatformAdapter):
             "last_reason": reason,
         }
 
+    def _load_group_review_state(self) -> None:
+        self._group_review_pending = {}
+        self._group_review_next_id = 1
+        path = self._group_review_state_path
+        if not path or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.debug("LINE: could not load group review state: %s", exc)
+            return
+        if not isinstance(data, dict):
+            return
+        pending = data.get("pending", {})
+        if isinstance(pending, dict):
+            self._group_review_pending = {
+                str(key): value
+                for key, value in pending.items()
+                if isinstance(value, dict)
+            }
+        try:
+            self._group_review_next_id = max(1, int(data.get("next_id") or 1))
+        except (TypeError, ValueError):
+            self._group_review_next_id = 1
+
+    def _save_group_review_state(self) -> None:
+        path = self._group_review_state_path
+        if not path:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "updated_at": time.time(),
+                "next_id": self._group_review_next_id,
+                "pending": self._group_review_pending,
+            }
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            tmp.replace(path)
+        except Exception as exc:
+            logger.debug("LINE: could not save group review state: %s", exc)
+
+    def _append_group_review_log(self, record: Dict[str, Any], decision: Dict[str, Any]) -> None:
+        path = self._group_review_log_path
+        if not path:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            row = {
+                "ts": time.time(),
+                "review_id": record.get("review_id"),
+                "chat_id": record.get("chat_id"),
+                "sender_user_id": record.get("sender_user_id"),
+                "message_id": record.get("message_id"),
+                "message_type": record.get("message_type"),
+                "text": record.get("text"),
+                "decision": decision,
+            }
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.debug("LINE: could not append group review log: %s", exc)
+
+    def _append_group_review_memory(self, record: Dict[str, Any], decision: Dict[str, Any]) -> None:
+        path = self._group_review_memory_path
+        if not path:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_text(
+                    "# LINE Group Review Training\n\n"
+                    "Human-reviewed examples for when Daisy should stay quiet, remember, or reply in groups.\n\n",
+                    encoding="utf-8",
+                )
+            action = str(decision.get("action") or "").strip()
+            note = str(decision.get("note") or decision.get("reply") or "").strip()
+            text = str(record.get("text") or "").strip()
+            ts = time.strftime("%Y-%m-%d %H:%M:%S %z", time.localtime(float(record.get("ts") or time.time())))
+            line = (
+                f"- {ts} D{record.get('review_id')} action={action}; "
+                f"group={record.get('chat_id')}; sender={record.get('sender_user_id')}; "
+                f"message={text[:300]!r}"
+            )
+            if note:
+                line += f"; owner={note[:300]!r}"
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception as exc:
+            logger.debug("LINE: could not append group review memory: %s", exc)
+
+    def _group_review_enabled_for(self, chat_id: str, user_id: str) -> bool:
+        if not self.group_review_enabled:
+            return False
+        if not self.group_review_owner_user_id:
+            return False
+        if self.group_review_groups and chat_id not in self.group_review_groups:
+            return False
+        if user_id and user_id == self.group_review_owner_user_id:
+            return False
+        return True
+
+    def _allocate_group_review_id(self) -> str:
+        review_id = str(max(1, int(self._group_review_next_id or 1)))
+        self._group_review_next_id = int(review_id) + 1
+        return review_id
+
+    def _trim_group_review_pending(self) -> None:
+        limit = max(1, int(self.group_review_max_pending or 50))
+        if len(self._group_review_pending) <= limit:
+            return
+        ordered = sorted(
+            self._group_review_pending.items(),
+            key=lambda item: float(item[1].get("ts") or 0),
+        )
+        self._group_review_pending = dict(ordered[-limit:])
+
+    def _latest_group_review_pending_id_for_chat(self, chat_id: str) -> Optional[str]:
+        if not chat_id:
+            return None
+        candidates = [
+            (review_id, record)
+            for review_id, record in self._group_review_pending.items()
+            if str(record.get("chat_id") or "") == chat_id
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: float(item[1].get("ts") or 0))[0]
+
+    def _format_group_review_notice(self, record: Dict[str, Any]) -> str:
+        review_id = str(record.get("review_id") or "").strip()
+        clean_text = str(record.get("text") or "").strip() or f"[{record.get('message_type') or 'message'}]"
+        preview = clean_text.replace("\n", "\n  ")
+        if len(preview) > 600:
+            preview = preview[:597] + "..."
+        draft_reply = str(record.get("draft_reply") or "").strip()
+        draft_preview = draft_reply or "（沒有，這則原本不會主動回）"
+        if len(draft_preview) > 900:
+            draft_preview = draft_preview[:897] + "..."
+        return (
+            f"【Daisy 群聊審核 D{review_id}】\n"
+            f"ATV 群有人發訊息：\n"
+            f"{preview}\n\n"
+            f"Daisy 原本預備回答：\n"
+            f"{draft_preview}\n\n"
+            f"回覆我：\n"
+            f"1 不回\n"
+            f"2 <學到的規則>\n"
+            f"3 <要發到群裡的話>\n"
+            f"4 用 Daisy 原本預備回答\n"
+            f"也可用：D{review_id} 不回 / D{review_id} 記 / D{review_id} 回"
+        )
+
+    async def _maybe_notify_group_review(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        message_id: str,
+        message_type: str,
+        text: str,
+    ) -> None:
+        if not self._client or not self._group_review_enabled_for(chat_id, user_id):
+            return
+        clean_text = (text or "").strip() or f"[{message_type}]"
+        draft_reply = ""
+        review_id = self._allocate_group_review_id()
+        record = {
+            "review_id": review_id,
+            "ts": time.time(),
+            "chat_id": chat_id,
+            "sender_user_id": user_id,
+            "message_id": message_id,
+            "message_type": message_type,
+            "text": clean_text,
+            "draft_reply": draft_reply,
+        }
+        self._group_review_pending[review_id] = record
+        self._trim_group_review_pending()
+        self._save_group_review_state()
+
+        notice = self._format_group_review_notice(record)
+        try:
+            await self._client.push(self.group_review_owner_user_id, [_text_message(notice)])
+        except Exception as exc:
+            logger.warning("LINE: group review owner notification failed: %s", exc)
+
+    async def _capture_group_review_draft(self, chat_id: str, content: str) -> Optional[SendResult]:
+        if not self._client or not self.group_review_enabled:
+            return None
+        if self.group_review_groups and chat_id not in self.group_review_groups:
+            return None
+        review_id = self._latest_group_review_pending_id_for_chat(chat_id)
+        if not review_id:
+            return None
+        draft = strip_markdown_preserving_urls(str(content or "")).strip()
+        if not draft:
+            return None
+        record = self._group_review_pending.get(review_id)
+        if not record:
+            return None
+        record["draft_reply"] = draft
+        self._group_review_pending[review_id] = record
+        self._save_group_review_state()
+        notice = self._format_group_review_notice(record)
+        try:
+            await self._client.push(self.group_review_owner_user_id, [_text_message(notice)])
+        except Exception as exc:
+            logger.warning("LINE: group review draft notification failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+        return SendResult(success=True, message_id=f"group-review-draft-{review_id}")
+
+    async def _handle_group_review_owner_command(self, chat_id: str, user_id: str, text: str) -> bool:
+        if not self.group_review_enabled or user_id != self.group_review_owner_user_id:
+            return False
+        text_value = text or ""
+        option_match = re.match(
+            r"^\s*([1-4１２３４])(?:[\.、\s:：-]+)?(.*)$",
+            text_value,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if option_match:
+            if not self._group_review_pending:
+                await self._send_text_chunks(chat_id, "目前沒有待處理的群聊審核。", force_push=False)
+                return True
+            review_id = max(
+                self._group_review_pending,
+                key=lambda key: float(self._group_review_pending[key].get("ts") or 0),
+            )
+            option, payload = option_match.groups()
+            option = option.translate(str.maketrans("１２３４", "1234"))
+            raw_action = {
+                "1": "不回",
+                "2": "記",
+                "3": "回",
+                "4": "draft",
+            }[option]
+        else:
+            match = re.match(
+                r"^\s*[DdＤｄ]\s*(\d{1,6})(?:\s*(不回|略過|skip|記錄|記|remember|回|發|reply|send)\s*(.*))?\s*$",
+                text_value,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not match:
+                return False
+            review_id, raw_action, payload = match.groups()
+        if not review_id:
+            return False
+
+        record = self._group_review_pending.get(str(int(review_id)))
+        if not record:
+            await self._send_text_chunks(chat_id, f"D{review_id} 找不到或已處理。", force_push=False)
+            return True
+
+        action_key = (raw_action or "不回").strip().lower()
+        payload = (payload or "").strip()
+        if action_key == "draft":
+            draft_reply = str(record.get("draft_reply") or "").strip()
+            if not draft_reply:
+                decision = {"action": "skip", "note": "no draft reply"}
+                ack = f"D{review_id} 沒有預備回答，已標記不回。"
+            else:
+                try:
+                    await self._client.push(record["chat_id"], [_text_message(draft_reply)])
+                    self._mark_group_reply(str(record.get("chat_id") or ""))
+                except Exception as exc:
+                    await self._send_text_chunks(chat_id, f"D{review_id} 發群失敗：{exc}", force_push=False)
+                    return True
+                decision = {"action": "reply", "reply": draft_reply, "source": "draft"}
+                ack = f"D{review_id} 已用 Daisy 預備回答發到群裡。"
+        elif action_key in {"回", "發", "reply", "send"}:
+            if not payload:
+                await self._send_text_chunks(chat_id, f"D{review_id} 要回群裡的文字是什麼？", force_push=False)
+                return True
+            try:
+                await self._client.push(record["chat_id"], [_text_message(payload)])
+                self._mark_group_reply(str(record.get("chat_id") or ""))
+            except Exception as exc:
+                await self._send_text_chunks(chat_id, f"D{review_id} 發群失敗：{exc}", force_push=False)
+                return True
+            decision = {"action": "reply", "reply": payload}
+            ack = f"D{review_id} 已發到群裡，並記錄。"
+        elif action_key in {"記", "記錄", "remember"}:
+            decision = {"action": "remember", "note": payload}
+            ack = f"D{review_id} 已記錄。"
+        else:
+            decision = {"action": "skip", "note": payload}
+            ack = f"D{review_id} 已標記不回。"
+
+        self._append_group_review_log(record, decision)
+        self._append_group_review_memory(record, decision)
+        self._group_review_pending.pop(str(int(review_id)), None)
+        self._save_group_review_state()
+        await self._send_text_chunks(chat_id, ack, force_push=False)
+        return True
+
     async def _download_media(
         self,
         message_id: str,
@@ -2756,12 +3189,20 @@ class LineAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        content = _sanitize_user_visible_content(content)
+        if not content:
+            logger.info("LINE: suppressed empty/internal content for chat %s", chat_id)
+            return SendResult(success=True, message_id=None)
         if _is_internal_notice(content):
             logger.info("LINE: suppressed internal notice for chat %s", chat_id)
             return SendResult(success=True, message_id=None)
 
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
+
+        draft_capture = await self._capture_group_review_draft(chat_id, content)
+        if draft_capture is not None:
+            return draft_capture
 
         # System busy-acks (interrupting / queued / steered) bypass the
         # postback cache and route directly to LINE so they reach the user

@@ -40,7 +40,7 @@ import time
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -200,6 +200,333 @@ def _is_xiaowei_wechat_profile(platform: Any) -> bool:
     )
 
 
+def _is_daisy_line_profile(platform: Any) -> bool:
+    return (
+        _platform_key(platform) == "line"
+        and _hermes_home.expanduser().resolve()
+        == Path("/Users/vc/.hermes/profiles/daisy").resolve()
+    )
+
+
+def _supports_simple_reminder_shortcut(platform: Any) -> bool:
+    return _is_daisy_line_profile(platform) or _is_xiaowei_wechat_profile(platform)
+
+
+_ZH_WEEKDAY_MAP = {
+    "一": 0,
+    "二": 1,
+    "三": 2,
+    "四": 3,
+    "五": 4,
+    "六": 5,
+    "日": 6,
+    "天": 6,
+}
+
+
+def _normalize_daisy_reminder_text(text: str) -> str:
+    return (text or "").translate(_FULLWIDTH_DIGIT_TRANSLATION).strip()
+
+
+def _parse_daisy_reminder_datetime(text: str) -> Optional[datetime]:
+    """Parse common zh-Hant reminder times for Daisy's LINE shortcut.
+
+    This intentionally covers short personal commands, not every natural
+    language date. Unknown shapes fall through to the normal agent.
+    """
+    from hermes_time import now as _hermes_now
+
+    raw = _normalize_daisy_reminder_text(text)
+    now = _hermes_now()
+    base_date = None
+
+    absolute = re.search(r"(?:(20\d{2})[/-])?(\d{1,2})[/-](\d{1,2})", raw)
+    if absolute:
+        year = int(absolute.group(1) or now.year)
+        month = int(absolute.group(2))
+        day = int(absolute.group(3))
+        try:
+            candidate = now.replace(year=year, month=month, day=day)
+        except ValueError:
+            return None
+        if absolute.group(1) is None and candidate.date() < now.date():
+            try:
+                candidate = candidate.replace(year=year + 1)
+            except ValueError:
+                return None
+        base_date = candidate.date()
+    elif "後天" in raw:
+        base_date = (now + timedelta(days=2)).date()
+    elif "明天" in raw:
+        base_date = (now + timedelta(days=1)).date()
+    elif "今天" in raw or "今晚" in raw:
+        base_date = now.date()
+    else:
+        weekday_match = re.search(r"(下)?(?:週|星期|禮拜)([一二三四五六日天])", raw)
+        if weekday_match:
+            target = _ZH_WEEKDAY_MAP[weekday_match.group(2)]
+            days_ahead = (target - now.weekday()) % 7
+            if weekday_match.group(1):
+                if days_ahead == 0:
+                    days_ahead = 7
+            elif days_ahead == 0:
+                # If the time later proves to be past, we advance another week.
+                days_ahead = 0
+            base_date = (now + timedelta(days=days_ahead)).date()
+
+    if base_date is None:
+        return None
+
+    period_match = re.search(r"(凌晨|清晨|早上|上午|中午|下午|傍晚|晚上|晚間|今晚)", raw)
+    period = period_match.group(1) if period_match else ""
+    time_match = re.search(r"(\d{1,2})\s*[:：]\s*(\d{1,2})", raw)
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2))
+    else:
+        time_match = re.search(r"(\d{1,2})\s*點\s*(半|(\d{1,2})\s*分?)?", raw)
+        if not time_match:
+            return None
+        hour = int(time_match.group(1))
+        minute = 30 if time_match.group(2) == "半" else int(time_match.group(3) or 0)
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    if period in {"下午", "傍晚", "晚上", "晚間", "今晚"} and 1 <= hour <= 11:
+        hour += 12
+    elif period == "中午" and hour < 11:
+        hour += 12
+
+    dt = datetime.combine(base_date, datetime.min.time()).replace(
+        hour=hour,
+        minute=minute,
+        tzinfo=now.tzinfo,
+    )
+    if dt <= now:
+        weekday_match = re.search(r"(?:週|星期|禮拜)([一二三四五六日天])", raw)
+        if weekday_match:
+            dt += timedelta(days=7)
+        elif "今天" in raw or "今晚" in raw:
+            return None
+    return dt
+
+
+def _extract_daisy_reminder_content(text: str) -> str:
+    content = _normalize_daisy_reminder_text(text)
+    cleanup_patterns = [
+        r"(?:(?:20\d{2})[/-])?\d{1,2}[/-]\d{1,2}",
+        r"(?:下)?(?:週|星期|禮拜)[一二三四五六日天]",
+        r"今天|今晚|明天|後天",
+        r"凌晨|清晨|早上|上午|中午|下午|傍晚|晚上|晚間",
+        r"\d{1,2}\s*[:：]\s*\d{1,2}",
+        r"\d{1,2}\s*點\s*(?:半|\d{1,2}\s*分?)?",
+        r"麻煩|幫我|請|記得|提醒我|提醒|叫我",
+    ]
+    for pattern in cleanup_patterns:
+        content = re.sub(pattern, " ", content)
+    content = re.sub(r"\s+", " ", content)
+    return content.strip(" ，,。.:：-—")
+
+
+def _format_daisy_reminder_time(dt: datetime) -> str:
+    weekday = "一二三四五六日"[dt.weekday()]
+    return f"{dt.month}/{dt.day}（{weekday}）{dt.hour:02d}:{dt.minute:02d}"
+
+
+def _daisy_reminder_tokens(content: str) -> list[str]:
+    tokens = re.findall(r"[A-Za-z0-9]{2,}", content.upper())
+    zh = re.sub(r"[A-Za-z0-9\s，,。.:：\-—]", "", content)
+    if len(zh) >= 2:
+        tokens.append(zh)
+    return tokens
+
+
+def _find_existing_daisy_reminder(dt: datetime, content: str) -> Optional[dict]:
+    try:
+        from cron.jobs import load_jobs
+    except Exception:
+        return None
+
+    target_minute = dt.replace(second=0, microsecond=0)
+    tokens = _daisy_reminder_tokens(content)
+    scripts_dir = _hermes_home / "scripts"
+    for job in load_jobs():
+        if not isinstance(job, dict) or not job.get("enabled", True):
+            continue
+        if (job.get("repeat") or {}).get("completed", 0):
+            continue
+        schedule = job.get("schedule") or {}
+        if schedule.get("kind") != "once" or not schedule.get("run_at"):
+            continue
+        try:
+            run_at = datetime.fromisoformat(str(schedule["run_at"])).replace(second=0, microsecond=0)
+        except Exception:
+            continue
+        if run_at != target_minute:
+            continue
+        haystack = " ".join(str(job.get(key) or "") for key in ("name", "prompt", "script")).upper()
+        script = str(job.get("script") or "").strip()
+        if script:
+            try:
+                script_text = (scripts_dir / script).read_text(encoding="utf-8")
+                haystack += " " + script_text.upper()
+            except Exception:
+                pass
+        if not tokens or all(token in haystack for token in tokens):
+            return job
+    return None
+
+
+def _ensure_daisy_reminder(dt: datetime, content: str, source: Any) -> str:
+    existing = _find_existing_daisy_reminder(dt, content)
+    when = _format_daisy_reminder_time(dt)
+    if existing:
+        return f"已經排好了：{when} 提醒你{content}。"
+
+    import uuid
+    from cron.jobs import create_job
+
+    script_dir = _hermes_home / "scripts" / "reminders"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    script_name = f"reminders/simple_reminder_{dt.strftime('%Y%m%d_%H%M')}_{uuid.uuid4().hex[:6]}.sh"
+    script_path = _hermes_home / "scripts" / script_name
+    message = f"閃亮，提醒你：{content}。"
+    script_path.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' {shlex.quote(message)}\n",
+        encoding="utf-8",
+    )
+    try:
+        os.chmod(script_path, 0o700)
+    except OSError:
+        pass
+
+    origin = {
+        "platform": getattr(source.platform, "value", source.platform) if source else "line",
+        "chat_id": getattr(source, "chat_id", None),
+        "chat_name": getattr(source, "chat_name", None),
+        "thread_id": getattr(source, "thread_id", None),
+    }
+    origin = {k: v for k, v in origin.items() if v}
+    job = create_job(
+        prompt="",
+        schedule=dt.isoformat(timespec="minutes"),
+        name=f"提醒：{content}"[:50],
+        repeat=1,
+        deliver=None,
+        origin=origin or None,
+        script=script_name,
+        no_agent=True,
+    )
+    logger.info("Daisy simple reminder shortcut created job=%s at=%s", job.get("id"), dt.isoformat())
+    return f"排好了：{when} 提醒你{content}。"
+
+
+def _create_daisy_simple_reminder(text: str, source: Any) -> Optional[str]:
+    raw = _normalize_daisy_reminder_text(text)
+    if not raw or raw.startswith("/") or "提醒" not in raw:
+        return None
+
+    dt = _parse_daisy_reminder_datetime(raw)
+    if dt is None:
+        return None
+    content = _extract_daisy_reminder_content(raw)
+    if len(content) < 2:
+        return None
+
+    return _ensure_daisy_reminder(dt, content, source)
+
+
+def _extract_tool_call_json_payload(text: str) -> Optional[dict[str, Any]]:
+    """Return a leaked tool-call JSON object when a model printed it as chat."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    name = str(payload.get("name") or "").strip().lower()
+    arguments = payload.get("arguments")
+    if name and isinstance(arguments, (dict, str)):
+        return payload
+    return None
+
+
+def _repair_daisy_cronjob_tool_leak(payload: dict[str, Any], source: Any) -> Optional[str]:
+    if str(payload.get("name") or "").strip().lower() != "cronjob":
+        return None
+    arguments = payload.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except Exception:
+            return None
+    if not isinstance(arguments, dict):
+        return None
+    if str(arguments.get("action") or "").strip().lower() != "create":
+        return None
+
+    schedule = str(arguments.get("schedule") or "").strip()
+    prompt = str(arguments.get("prompt") or arguments.get("name") or "").strip()
+    if not schedule or not prompt:
+        return None
+    try:
+        dt = datetime.fromisoformat(schedule)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        try:
+            from hermes_time import now as _hermes_now
+
+            dt = dt.replace(tzinfo=_hermes_now().tzinfo)
+        except Exception:
+            pass
+    content = _extract_daisy_reminder_content(prompt)
+    if len(content) < 2:
+        return None
+    return _ensure_daisy_reminder(dt, content, source)
+
+
+def _sanitize_internal_instruction_leak(response: str, source: Any) -> str:
+    if not response:
+        return response
+    text = response.strip()
+    lowered = text.lower()
+    platform_key = _platform_key(getattr(source, "platform", ""))
+    if platform_key in {"line", "weixin"}:
+        payload = _extract_tool_call_json_payload(text)
+        raw_tool_json_leak = payload is not None or (
+            re.search(r'"name"\s*:\s*"[^"]+"', text)
+            and re.search(r'"arguments"\s*:', text)
+        )
+        if raw_tool_json_leak:
+            if payload and _supports_simple_reminder_shortcut(getattr(source, "platform", "")):
+                repaired = _repair_daisy_cronjob_tool_leak(payload, source)
+                if repaired:
+                    return repaired
+            return "我剛剛不該把內部工具內容貼給你。這件事我會直接處理。"
+
+    hermes_leak = (
+        "hermes cronjob" in lowered
+        or "built-in cronjob tool" in lowered
+        or "~/.hermes/cron/jobs.json" in lowered
+        or "run the following command" in lowered and "hermes" in lowered
+    )
+    if hermes_leak and platform_key in {"line", "weixin"}:
+        return "我剛剛不該把內部操作說明貼給你。這種提醒我會直接排，不會叫你跑指令。"
+    return response
+
+
 def _open_xiaowei_todos() -> list[dict]:
     path = _hermes_home / "data" / "todos.json"
     if not path.exists():
@@ -220,8 +547,102 @@ def _open_xiaowei_todos() -> list[dict]:
     ]
 
 
+def _load_xiaowei_todo_data() -> dict:
+    path = _hermes_home / "data" / "todos.json"
+    if not path.exists():
+        return {"version": 1, "items": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to read 小薇 todos from %s", path, exc_info=True)
+        return {"version": 1, "items": []}
+    if not isinstance(data, dict):
+        return {"version": 1, "items": []}
+    if not isinstance(data.get("items"), list):
+        data["items"] = []
+    return data
+
+
+def _write_xiaowei_todo_data(data: dict) -> None:
+    from datetime import timezone, timedelta
+
+    path = _hermes_home / "data" / "todos.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone(timedelta(hours=8)))
+    data["updated_at"] = now.isoformat(timespec="seconds")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _is_xiaowei_open_todo(item: Any) -> bool:
+    return (
+        isinstance(item, dict)
+        and str(item.get("status", "open")).lower() in {"open", "pending"}
+        and str(item.get("content", "")).strip()
+    )
+
+
+def _write_xiaowei_todo_view_snapshot(items: list[dict], *, title: str) -> None:
+    """Persist the visible todo numbering from the last list response.
+
+    Users complete items by the number they just saw in chat.  The open list can
+    shift after any completion, so the number must resolve through this snapshot
+    before falling back to the current open-order list.
+    """
+    from datetime import timezone, timedelta
+
+    path = _hermes_home / "data" / "todo_view_snapshot.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+    payload = {
+        "version": 1,
+        "title": title,
+        "created_at": now,
+        "items": [
+            {
+                "index": idx,
+                "id": str(item.get("id") or "").strip(),
+                "content": str(item.get("content") or "").strip(),
+            }
+            for idx, item in enumerate(items, start=1)
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ],
+    }
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_xiaowei_todo_view_snapshot() -> dict[int, str]:
+    path = _hermes_home / "data" / "todo_view_snapshot.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to read 小薇 todo view snapshot from %s", path, exc_info=True)
+        return {}
+    rows = data.get("items", []) if isinstance(data, dict) else []
+    if not isinstance(rows, list):
+        return {}
+    snapshot: dict[int, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            index = int(row.get("index"))
+        except (TypeError, ValueError):
+            continue
+        todo_id = str(row.get("id") or "").strip()
+        if index > 0 and todo_id:
+            snapshot[index] = todo_id
+    return snapshot
+
+
 def _format_xiaowei_todos(*, title: str = "目前待辦") -> str:
     items = _open_xiaowei_todos()
+    _write_xiaowei_todo_view_snapshot(items, title=title)
     if not items:
         return f"閃亮超人，{title}沒有未完成項目。"
     lines = [f"閃亮超人，{title}有 {len(items)} 項：", ""]
@@ -265,8 +686,46 @@ def _has_xiaowei_todo_intent(text: str) -> bool:
     return "待辦" in normalized or "todo" in raw or "to-do" in raw
 
 
+def _is_xiaowei_referential_todo_add(text: str) -> bool:
+    normalized = _normalize_xiaowei_todo_query(text)
+    if "待辦" not in normalized:
+        return False
+    add_markers = (
+        "加到待辦",
+        "加入待辦",
+        "加進待辦",
+        "列入待辦",
+        "放到待辦",
+        "放進待辦",
+        "存到待辦",
+        "存進待辦",
+        "記到待辦",
+        "記進待辦",
+    )
+    reference_markers = (
+        "這件",
+        "這兩件",
+        "這幾件",
+        "這些",
+        "這兩個",
+        "這個",
+        "這段",
+        "上面",
+        "前面",
+        "剛剛",
+        "剛才",
+        "上一則",
+        "上一段",
+    )
+    return any(marker in normalized for marker in add_markers) and any(
+        marker in normalized for marker in reference_markers
+    )
+
+
 def _is_xiaowei_todo_query(text: str) -> bool:
     normalized = _normalize_xiaowei_todo_query(text)
+    if _is_xiaowei_referential_todo_add(text):
+        return False
     if normalized in {
         "待辦",
         "待辦事項",
@@ -277,6 +736,11 @@ def _is_xiaowei_todo_query(text: str) -> bool:
         "待辦呢",
         "今日待辦呢",
         "今天待辦呢",
+        "列一下",
+        "再列一下",
+        "重列一下",
+        "列一次",
+        "再列一次",
         "再發一次待辦",
         "再發待辦",
     }:
@@ -287,6 +751,104 @@ def _is_xiaowei_todo_query(text: str) -> bool:
 def _xiaowei_todo_title_for_query(text: str) -> str:
     normalized = _normalize_xiaowei_todo_query(text)
     return "今日待辦" if ("今日" in normalized or "今天" in normalized) else "目前待辦"
+
+
+def _extract_xiaowei_todo_status_update(text: str) -> Optional[tuple[list[int], str]]:
+    raw = (text or "").strip().translate(_FULLWIDTH_DIGIT_TRANSLATION)
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if re.search(r"(刪掉|刪除|删除|取消|cancel|remove)", lowered):
+        status = "cancelled"
+    elif re.search(r"(完成|done|好了|處理好|處理完|搞定)", lowered):
+        status = "completed"
+    else:
+        return None
+    numbers = [int(value) for value in re.findall(r"\d+", lowered)]
+    if not numbers:
+        return None
+
+    compact = _normalize_xiaowei_todo_query(lowered)
+    residue = re.sub(
+        r"\d+|待辦|todo|to-do|第|項|个|個|號|号|[\/,，、+&和及與並]|"
+        r"完成了?|已完成|done|好了?|處理好了?|處理完了?|搞定了?|"
+        r"刪掉|刪除|删除|取消|cancel(?:led)?|remove|"
+        r"也|都|全部|全都|一併|一起|順便|幫我|幫忙|請|麻煩|"
+        r"把|將|標記|標示|設成|改成|變成|已經|已|掉|了",
+        "",
+        compact,
+    )
+    if residue:
+        return None
+    unique_numbers = list(OrderedDict.fromkeys(numbers))
+    return unique_numbers, status
+
+
+def _mark_xiaowei_todos_by_open_indices(indices: list[int], status: str) -> str:
+    from datetime import timezone, timedelta
+
+    data = _load_xiaowei_todo_data()
+    items = data.get("items", [])
+    open_items = [item for item in items if _is_xiaowei_open_todo(item)]
+    snapshot = _load_xiaowei_todo_view_snapshot()
+    by_id = {
+        str(item.get("id") or "").strip(): item
+        for item in items
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+
+    invalid: list[int] = []
+    unavailable: list[int] = []
+    targets: list[tuple[int, dict]] = []
+    seen_ids: set[str] = set()
+    for index in indices:
+        item: dict | None = None
+        snapshot_id = snapshot.get(index)
+        if snapshot_id:
+            candidate = by_id.get(snapshot_id)
+            if candidate is None or not _is_xiaowei_open_todo(candidate):
+                unavailable.append(index)
+                continue
+            item = candidate
+        elif 1 <= index <= len(open_items):
+            item = open_items[index - 1]
+        else:
+            invalid.append(index)
+            continue
+
+        item_id = str(item.get("id") or "").strip()
+        if item_id and item_id in seen_ids:
+            continue
+        if item_id:
+            seen_ids.add(item_id)
+        targets.append((index, item))
+
+    if not targets:
+        details: list[str] = []
+        if invalid:
+            details.append(f"找不到第 {', '.join(map(str, invalid))} 項，目前只有 {len(open_items)} 項。")
+        if unavailable:
+            details.append(f"第 {', '.join(map(str, unavailable))} 項已經不是未完成項目。")
+        suffix = " ".join(details) if details else "沒有可更新的項目。"
+        return f"閃亮超人，{suffix}"
+
+    now = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+    changed: list[tuple[int, str]] = []
+    timestamp_key = "completed_at" if status == "completed" else "cancelled_at"
+    for index, item in targets:
+        item["status"] = status
+        item[timestamp_key] = now
+        changed.append((index, str(item.get("content", "")).strip()))
+    _write_xiaowei_todo_data(data)
+
+    action = "完成" if status == "completed" else "取消"
+    lines = [f"閃亮超人，已{action}：", ""]
+    lines.extend(f"- 第 {index} 項：**{content}**" for index, content in changed)
+    if invalid:
+        lines.extend(["", f"另外，第 {', '.join(map(str, invalid))} 項不存在，目前只有 {len(open_items)} 項。"])
+    if unavailable:
+        lines.extend(["", f"另外，第 {', '.join(map(str, unavailable))} 項已經不是未完成項目。"])
+    return "\n".join(lines)
 
 
 def _add_xiaowei_todo(content: str, *, category: str = "General") -> str:
@@ -339,10 +901,17 @@ def _handle_xiaowei_todo_batch(text: str) -> Optional[str]:
 
     added: list[str] = []
     duplicate_or_status: list[str] = []
+    status_updates: list[str] = []
     query_title: str | None = None
     handled = 0
 
     for line in lines:
+        status_update = _extract_xiaowei_todo_status_update(line)
+        if status_update:
+            indices, status = status_update
+            status_updates.append(_mark_xiaowei_todos_by_open_indices(indices, status))
+            handled += 1
+            continue
         item = _extract_xiaowei_todo_add(line)
         if item:
             result = _add_xiaowei_todo(item)
@@ -363,6 +932,7 @@ def _handle_xiaowei_todo_batch(text: str) -> Optional[str]:
 
     if query_title:
         parts: list[str] = []
+        parts.extend(status_updates)
         if added:
             if len(added) == 1:
                 parts.append(f"已列入待辦，閃亮超人：\n- **{added[0]}**")
@@ -374,9 +944,14 @@ def _handle_xiaowei_todo_batch(text: str) -> Optional[str]:
         return "\n\n".join(part for part in parts if part.strip())
 
     if len(added) == 1 and not duplicate_or_status:
+        if status_updates:
+            return "\n\n".join([*status_updates, f"已列入待辦：\n- **{added[0]}**"])
         return f"已列入待辦：\n- **{added[0]}**"
     if added:
-        return "已列入待辦：\n" + "\n".join(f"- **{item}**" for item in added)
+        add_reply = "已列入待辦：\n" + "\n".join(f"- **{item}**" for item in added)
+        return "\n\n".join([*status_updates, add_reply]) if status_updates else add_reply
+    if status_updates:
+        return "\n\n".join(status_updates)
     if duplicate_or_status:
         return "\n".join(duplicate_or_status)
     return None
@@ -427,6 +1002,102 @@ def _sync_xiaowei_todos_from_agent_messages(
     if synced:
         logger.info("Synced %d 小薇 in-session todo item(s) into durable store", synced)
     return synced
+
+
+def _normalize_xiaowei_contact_key(value: str) -> str:
+    text = (value or "").translate(_FULLWIDTH_DIGIT_TRANSLATION).lower()
+    text = re.sub(r"[\s　._\-・·/\\()（）［］\[\]{}<>《》「」『』:：,，。!?！？]+", "", text)
+    return text
+
+
+def _extract_xiaowei_extension_query(text: str) -> Optional[str]:
+    raw = (text or "").strip()
+    if not raw or raw.startswith("/"):
+        return None
+    if not re.search(r"(分機|extension|ext\.?)", raw, flags=re.IGNORECASE):
+        return None
+
+    cleaned = re.sub(r"^@?\s*(小薇|xiaowei)\s*[,，:：]?\s*", "", raw, flags=re.IGNORECASE)
+    patterns = (
+        r"^(?:請問|麻煩|幫我|幫忙|查一下|查|找一下|找)?\s*(.+?)(?:的)?\s*(?:分機|extension|ext\.?)\s*(?:是|多少|幾號|嗎|呢|[?？])*$",
+        r"^(?:分機|extension|ext\.?)\s*(?:查|找)?\s*(.+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, cleaned, flags=re.IGNORECASE)
+        if not match:
+            continue
+        query = match.group(1).strip()
+        query = re.sub(r"^(?:請問|麻煩|幫我|幫忙|查一下|查|找一下|找)\s*", "", query)
+        query = re.sub(r"(?:的|分機|extension|ext\.?|是|多少|幾號|嗎|呢|[?？!！。])+$", "", query, flags=re.IGNORECASE)
+        query = query.strip(" \t\r\n,，:：")
+        if query and len(_normalize_xiaowei_contact_key(query)) >= 2:
+            return query
+    return None
+
+
+def _open_xiaowei_contacts() -> list[dict]:
+    path = _hermes_home / "data" / "contact_directory.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("Failed to read 小薇 contact directory from %s", path, exc_info=True)
+        return []
+    entries = data.get("entries", []) if isinstance(data, dict) else []
+    if not isinstance(entries, list):
+        return []
+    return [
+        entry for entry in entries
+        if isinstance(entry, dict)
+        and str(entry.get("extension") or "").strip()
+    ]
+
+
+def _lookup_xiaowei_contacts(query: str) -> list[dict]:
+    wanted = _normalize_xiaowei_contact_key(query)
+    if not wanted:
+        return []
+    matches: list[dict] = []
+    for entry in _open_xiaowei_contacts():
+        candidates = [
+            str(entry.get("name") or ""),
+            str(entry.get("english_name") or ""),
+            str(entry.get("chinese_name") or ""),
+        ]
+        aliases = entry.get("aliases")
+        if isinstance(aliases, list):
+            candidates.extend(str(alias) for alias in aliases)
+        normalized = [_normalize_xiaowei_contact_key(candidate) for candidate in candidates if candidate]
+        if any(wanted == candidate or (len(wanted) >= 3 and wanted in candidate) for candidate in normalized):
+            matches.append(entry)
+    return matches
+
+
+def _format_xiaowei_contact(entry: dict) -> str:
+    english = str(entry.get("english_name") or "").strip()
+    chinese = str(entry.get("chinese_name") or "").strip()
+    name = str(entry.get("name") or "").strip()
+    display = " ".join(part for part in (english, chinese) if part).strip() or name or "這位同事"
+    extension = str(entry.get("extension") or "").strip()
+    return f"**{display}**：分機 **{extension}**"
+
+
+def _handle_xiaowei_extension_lookup(text: str) -> Optional[str]:
+    query = _extract_xiaowei_extension_query(text)
+    if not query:
+        return None
+    matches = _lookup_xiaowei_contacts(query)
+    if len(matches) == 1:
+        return f"閃亮超人，{_format_xiaowei_contact(matches[0])}。"
+    if len(matches) > 1:
+        lines = [f"閃亮超人，通訊錄裡找到 {len(matches)} 筆：", ""]
+        lines.extend(f"{idx}. {_format_xiaowei_contact(entry)}" for idx, entry in enumerate(matches, start=1))
+        return "\n".join(lines)
+    return (
+        f"閃亮超人，我目前查不到 **{query}** 的分機。\n"
+        "手上的通訊錄索引不完整，你再丟一次通訊錄給我，我會補齊。"
+    )
 
 
 def _truthy_config(value: Any, default: bool = False) -> bool:
@@ -5838,6 +6509,7 @@ class GatewayRunner:
         platform_group_chat_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
+            Platform("line"): "LINE_ALLOWED_GROUPS",
         }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
@@ -6363,6 +7035,10 @@ class GatewayRunner:
         if _is_xiaowei_wechat_profile(source.platform):
             _todo_text = (event.text or "").strip()
             if _todo_text and not _todo_text.startswith("/"):
+                _contact_lookup = _handle_xiaowei_extension_lookup(_todo_text)
+                if _contact_lookup is not None:
+                    logger.info("小薇 contact lookup shortcut: %s", _todo_text[:80])
+                    return _contact_lookup
                 _todo_batch = _handle_xiaowei_todo_batch(_todo_text)
                 if _todo_batch is not None:
                     logger.info("小薇 durable todo shortcut: %s", _todo_text[:80])
@@ -8036,6 +8712,16 @@ class GatewayRunner:
         if message_text is None:
             return
 
+        if _supports_simple_reminder_shortcut(source.platform):
+            try:
+                _simple_reminder = _create_daisy_simple_reminder(event.text or message_text, source)
+            except Exception as _reminder_exc:
+                logger.warning("Simple reminder shortcut failed: %s", _reminder_exc, exc_info=True)
+                _simple_reminder = None
+            if _simple_reminder is not None:
+                logger.info("Simple reminder shortcut: %s", (event.text or message_text)[:80])
+                return _simple_reminder
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -8094,6 +8780,7 @@ class GatewayRunner:
                 return None
 
             response = agent_result.get("final_response") or ""
+            response = _sanitize_internal_instruction_leak(response, source)
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
