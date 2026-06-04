@@ -1837,6 +1837,23 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         mark_mock.assert_called_once()
 
+    def test_context_compression_failure_does_not_deliver_to_chat(self):
+        error = (
+            "Context compression summary failed (peer closed connection without sending complete message body "
+            "(incomplete chunked read)). 7 historical message(s) were removed and replaced with a placeholder. "
+            "Earlier context is no longer recoverable. Consider /reset for a clean session, or check your "
+            "auxiliary.compression model configuration."
+        )
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(False, "# output", "", error)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_not_called()
+        mark_mock.assert_called_once()
+
     def test_output_saved_even_when_delivery_suppressed(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# full output", "[SILENT]", None)), \

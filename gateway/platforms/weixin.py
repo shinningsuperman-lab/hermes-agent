@@ -39,6 +39,8 @@ _INTERNAL_NOTICE_RE = re.compile(
     r"(?:"
     r"Self-improvement review|"
     r"No response from provider|non-streaming|Aborting call|Retrying in|"
+    r"Context compression summary failed|incomplete chunked read|historical message\(s\) were removed|"
+    r"auxiliary\.compression model|Earlier context is no longer recoverable|"
     r"Still working|Interrupting current task|iteration\s+\d+/\d+|running:\s*[\w.-]+|"
     r"codex went silent|retiring app-server session|app-server session|"
     r"Command approved|Dangerous command requires approval|requires approval|"

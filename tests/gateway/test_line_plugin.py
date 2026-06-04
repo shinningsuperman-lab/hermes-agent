@@ -450,6 +450,12 @@ class TestSendRouting:
             "Run codex in your terminal, then run hermes auth to re-authenticate."
         )
         assert _is_internal_notice(
+            "⚠️ Context compression summary failed (peer closed connection without sending complete message body "
+            "(incomplete chunked read)). 7 historical message(s) were removed and replaced with a placeholder. "
+            "Earlier context is no longer recoverable. Consider /reset for a clean session, or check your "
+            "auxiliary.compression model configuration."
+        )
+        assert _is_internal_notice(
             "{\n"
             '  "name": "cronjob",\n'
             '  "arguments": {\n'

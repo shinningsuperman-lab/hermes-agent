@@ -136,6 +136,9 @@ _INTERNAL_CRON_FAILURE_MARKERS = (
     "prompt contains invisible unicode",
     "Codex refresh token",
     "refresh token was already consumed",
+    "Context compression summary failed",
+    "incomplete chunked read",
+    "auxiliary.compression model",
     "hermes auth",
     "hermes model",
 )
