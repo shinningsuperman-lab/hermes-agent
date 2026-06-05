@@ -43,6 +43,23 @@ def test_parse_free_text_line():
     assert entries[0]["chinese_name"] == "陳泰瑞"
 
 
+def test_parse_stacked_text_contact_block():
+    importer = _load_importer()
+
+    entries = importer.parse_stacked_text(
+        "0968-370-922\n"
+        "Terry\n"
+        "林淑媛\n"
+        "15201\n"
+        "0937-030-628\n"
+    )
+
+    assert len(entries) == 1
+    assert entries[0]["english_name"] == "Terry"
+    assert entries[0]["chinese_name"] == "林淑媛"
+    assert entries[0]["extension"] == "15201"
+
+
 def test_parse_json_keeps_alias_list(tmp_path):
     importer = _load_importer()
     source = tmp_path / "contacts.json"

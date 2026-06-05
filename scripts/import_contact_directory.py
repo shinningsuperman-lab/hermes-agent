@@ -212,6 +212,39 @@ def parse_free_text(text: str) -> list[dict[str, Any]]:
     return entries
 
 
+def parse_stacked_text(text: str) -> list[dict[str, Any]]:
+    """Parse OCR/PDF text where a contact is split across adjacent lines.
+
+    Common exported directory shape:
+
+        Terry
+        林淑媛
+        15201
+        0937-030-628
+    """
+    lines = [normalize_text(line) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    entries: list[dict[str, Any]] = []
+    for index in range(max(0, len(lines) - 2)):
+        english = lines[index]
+        chinese = lines[index + 1]
+        extension = lines[index + 2]
+        if not re.fullmatch(r"[A-Za-z][A-Za-z .'-]{1,30}", english):
+            continue
+        if not re.fullmatch(r"[\u4e00-\u9fff]{2,5}", chinese):
+            continue
+        if not re.fullmatch(r"\d{3,6}", extension):
+            continue
+        if entry := make_entry(
+            english_name=english,
+            chinese_name=chinese,
+            extension=extension,
+            source_line=" / ".join(lines[index:index + 3]),
+        ):
+            entries.append(entry)
+    return entries
+
+
 def entry_from_row(row: dict[str, Any]) -> dict[str, Any] | None:
     extension = first_value(row, EXT_KEYS)
     name = first_value(row, NAME_KEYS)
@@ -242,8 +275,10 @@ def parse_input(path: Path) -> list[dict[str, Any]]:
     if suffix == ".xlsx":
         return parse_xlsx(path)
     if suffix == ".pdf":
-        return parse_free_text(read_pdf_text(path))
-    return parse_free_text(path.read_text(encoding="utf-8", errors="ignore"))
+        text = read_pdf_text(path)
+    else:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    return [*parse_free_text(text), *parse_stacked_text(text)]
 
 
 def merge_entries(entries: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
